@@ -4,9 +4,15 @@
 
 A small Mac desktop app that sends individual photos or a local folder to one Samsung The Frame TV. Built with Python, Qt Quick/QML, Pillow, and the same [samsungtvws](https://github.com/xchwarze/samsung-tv-ws-api) library credited by [FrameDeck](https://apps.labwyze.com/app/framedeck/).
 
+## Download for Mac
+
+[Download FrameSync for Apple Silicon (ZIP)](https://github.com/kcverde/framesync/releases/latest/download/FrameSync-macOS-arm64.zip). Requires macOS 26 or later. Double-click the ZIP, drag **FrameSync.app** to **Applications**, then open it. Python and Qt are included.
+
+This build uses an ad-hoc signature and has no Apple notarization. If macOS says it cannot verify the developer and you trust this download, open **System Settings → Privacy & Security** and choose **Open Anyway** for FrameSync. [Apple’s first-open instructions](https://support.apple.com/en-us/102445)
+
 ## Run from source
 
-FrameSync is currently distributed as source. Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run these commands on your Mac:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run these commands on your Mac:
 
 ```sh
 git clone https://github.com/kcverde/framesync.git
@@ -23,7 +29,7 @@ Use the **◐** button beside the connection status to choose **System**, **Ligh
 On macOS, run these commands from the checkout:
 
 ```sh
-uv run --locked --group packaging --python 3.14 pyinstaller packaging/macos/FrameSync.spec
+uv run --locked --group packaging --managed-python --python 3.13 pyinstaller packaging/macos/FrameSync.spec
 codesign --verify --deep --strict dist/FrameSync.app
 ditto -c -k --sequesterRsrc --keepParent dist/FrameSync.app dist/FrameSync-macOS.zip
 ```

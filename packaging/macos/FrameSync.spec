@@ -6,7 +6,10 @@ from PyInstaller.utils.hooks import collect_data_files
 
 here = Path(SPECPATH)
 root = here.parents[1]
-data = collect_data_files("framesync") + [(str(here / "notices"), "notices/Qt")]
+data = collect_data_files("framesync") + [
+    (str(root / "LICENSE"), "notices/FrameSync"),
+    (str(here / "notices"), "notices/Qt"),
+]
 for package in ("PySide6-Essentials", "shiboken6", "Pillow", "samsungtvws", "websocket-client",
                 "requests", "certifi", "urllib3", "charset-normalizer", "idna", "yarl", "propcache", "multidict", "PyInstaller"):
     dist = distribution(package)
