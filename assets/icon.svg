@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x2=".32" y2="1">
+      <stop stop-color="#490e4c"/>
+      <stop offset=".52" stop-color="#360837"/>
+      <stop offset="1" stop-color="#280628"/>
+    </linearGradient>
+    <linearGradient id="amber" x2="1" y2=".8">
+      <stop stop-color="#ffc042"/>
+      <stop offset="1" stop-color="#ffab22"/>
+    </linearGradient>
+    <linearGradient id="lilac" x2=".8" y2="1">
+      <stop stop-color="#d1a2ff"/>
+      <stop offset="1" stop-color="#b782f2"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="25" fill="url(#tile)"/>
+  <g transform="translate(17 33) scale(.94)" fill="none" stroke-width="9">
+    <path stroke="url(#amber)" d="M34 5h61v51H34z"/>
+    <path stroke="url(#lilac)" d="M5 22h43v39H5z"/>
+    <path stroke="#ffb12b" d="M39 56h17"/>
+  </g>
+</svg>

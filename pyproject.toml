@@ -1,0 +1,19 @@
+[project]
+name = "framesync"
+version = "0.1.0"
+description = "Simple local photo sync for Samsung The Frame"
+license = "MIT"
+requires-python = ">=3.12,<3.15"
+dependencies = ["PySide6-Essentials>=6.10,<7", "Pillow>=12,<13", "samsungtvws==3.0.7"]
+
+[project.scripts]
+framesync = "framesync.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+packaging = [
+    "pyinstaller>=6.20,<7",
+]

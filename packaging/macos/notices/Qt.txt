@@ -1,0 +1,9 @@
+FrameSync includes Qt shared libraries, the PySide6 Python bindings, and Shiboken
+from The Qt Company and Qt contributors. They are distributed separately inside
+Contents/Frameworks. The Qt and Qt for Python open-source license terms are
+available in the accompanying LGPL-3.0.txt and GPL-3.0.txt files.
+
+Upstream sources:
+https://code.qt.io/cgit/qt/
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+The exact PySide6 and Shiboken versions are recorded in the project’s uv.lock.
