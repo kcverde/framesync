@@ -111,7 +111,34 @@ ColumnLayout {
         }
     }
 
-    Label { text: "Discover"; font.family: page.headingFamily; font.pixelSize: 38 }
+    RowLayout {
+        Layout.fillWidth: true
+        Label { text: "Discover"; font.family: page.headingFamily; font.pixelSize: 38; Layout.fillWidth: true }
+        Button {
+            objectName: "myframeFitCard"
+            text: "Make art for your Frame"
+            Accessible.description: "Opens myframe.fit in your default browser"
+            implicitWidth: 320
+            implicitHeight: 50
+            padding: 0
+            background: null
+            contentItem: Image {
+                source: "myframe-fit-card.png"
+                fillMode: Image.PreserveAspectFit
+            }
+            HoverHandler { cursorShape: Qt.PointingHandCursor }
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: -3
+                radius: 13
+                color: "transparent"
+                border.width: 2
+                border.color: FrameTheme.violet
+                visible: parent.visualFocus
+            }
+            onClicked: Qt.openUrlExternally("https://myframe.fit")
+        }
+    }
     RowLayout {
         Layout.fillWidth: true
         FrameComboBox {

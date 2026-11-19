@@ -4,6 +4,8 @@
 
 A small Mac desktop app that sends individual photos or a local folder to one Samsung The Frame TV. Built with Python, Qt Quick/QML, Pillow, and the same [samsungtvws](https://github.com/xchwarze/samsung-tv-ws-api) library credited by [FrameDeck](https://apps.labwyze.com/app/framedeck/).
 
+**Want to make your own Frame art?** Visit [myframe.fit](https://myframe.fit).
+
 ## Download for Mac
 
 [Download FrameSync for Apple Silicon (ZIP)](https://github.com/kcverde/framesync/releases/latest/download/FrameSync-macOS-arm64.zip). Requires macOS 26 or later. Double-click the ZIP, drag **FrameSync.app** to **Applications**, then open it. Python and Qt are included.
