@@ -12,6 +12,8 @@ A small Mac desktop app that sends individual photos or a local folder to one Sa
 
 This build uses an ad-hoc signature and has no Apple notarization. If macOS says it cannot verify the developer and you trust this download, open **System Settings → Privacy & Security** and choose **Open Anyway** for FrameSync. [Apple’s first-open instructions](https://support.apple.com/en-us/102445)
 
+![FrameSync’s Local photos view in dark mode, showing six images ready to sync in 4K](assets/framesync-local-photos.png)
+
 ## Run from source
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run these commands on your Mac:
