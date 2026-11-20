@@ -162,6 +162,41 @@ ApplicationWindow {
                     }
                     FrameButton { objectName: "connect"; text: win.session.reconnecting ? "Reconnecting…" : "Connect"; enabled: !win.session.busy && !win.session.reconnecting; onClicked: backend.launch(false) }
                 }
+                FrameButton {
+                    objectName: "myframeFitSidebarCard"
+                    Layout.fillWidth: true
+                    visible: win.page === "library"
+                    horizontalPadding: 8
+                    text: "Make art for your Frame"
+                    Accessible.description: "Opens myframe.fit in your default browser"
+                    contentItem: RowLayout {
+                        spacing: 8
+                        Image {
+                            source: "myframe-fit-card.png"
+                            // Use the dog thumbnail from the wide Discover banner.
+                            sourceClipRect: Qt.rect(12, 12, 122, 76)
+                            Layout.preferredWidth: 48
+                            Layout.preferredHeight: 30
+                            fillMode: Image.PreserveAspectFit
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            Label {
+                                Layout.fillWidth: true
+                                text: "Make art for\nyour Frame"
+                                wrapMode: Text.WordWrap
+                                font.pixelSize: 13
+                                font.weight: Font.DemiBold
+                                color: FrameTheme.ink
+                            }
+                            Label { text: "myframe.fit"; font.pixelSize: 12; color: FrameTheme.muted }
+                        }
+                        Label { text: "›"; font.pixelSize: 20; color: FrameTheme.violet }
+                    }
+                    HoverHandler { cursorShape: Qt.PointingHandCursor }
+                    onClicked: Qt.openUrlExternally("https://myframe.fit")
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 2
