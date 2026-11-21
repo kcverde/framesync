@@ -184,3 +184,141 @@ class MuseumTests(unittest.TestCase):
             self.assertEqual(library.keys_on_tv("other tv", {"crop-id"}), set())
             library.toggle(work)
             self.assertEqual(library.saved(), {})
+
+    def test_museum_request_requires_https_and_skips_missing_commons_pages(self):
+        import stat
+        from framesync.museum_providers import _HttpsOnlyRedirectHandler, chicago_reproductions, met_artwork, museum_request
+
+        for bad_url in ("file:///etc/passwd", "http://example.org/image.jpg", "ftp://example.org/a.jpg", "https://"):
+            with self.subTest(url=bad_url), self.assertRaises(ValueError):
+                museum_request(bad_url)
+        req = museum_request("https://example.org/image.jpg")
+        self.assertIn("https://github.com/kcverde/framesync", req.get_header("User-agent"))
+
+        # Redirects to non-HTTPS schemes must be rejected.
+        handler = _HttpsOnlyRedirectHandler()
+        for bad_redirect in ("http://example.org/a.jpg", "ftp://example.org/a.jpg", "file:///etc/passwd"):
+            with self.subTest(redirect=bad_redirect), self.assertRaises(ValueError):
+                handler.redirect_request(req, None, 302, "Found", {}, bad_redirect)
+
+        # Optional fields omitted by Met API should fall back cleanly instead of raising KeyError.
+        minimal = met_artwork({"objectID": 42, "isPublicDomain": True, "primaryImage": "https://example.org/a.jpg"})
+        self.assertEqual((minimal["title"], minimal["artist"], minimal["preview"]),
+                         ("Untitled", "Unknown artist", "https://example.org/a.jpg"))
+
+        # Missing Commons pages (negative page IDs) must not trigger a second Commons request.
+        works = [dict(id=8, width=0, height=0)]
+        responses = [
+            {"results": {"bindings": [{"id": {"value": "8"}, "image": {"value": "https://commons.wikimedia.org/wiki/Special:FilePath/Missing.jpg"}}]}},
+            {"query": {"pages": {"-1": {"title": "File:Missing.jpg", "missing": ""}}}},
+        ]
+        calls = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            return responses.pop(0)
+
+        chicago_reproductions(works, fake_fetch, lambda: False)
+        self.assertEqual(len(calls), 2)
+
+        # Redirecting an alias to a canonical title must merge works instead of overwriting them.
+        both = [dict(id=1, width=0, height=0), dict(id=2, width=0, height=0)]
+        image = dict(url="https://upload.wikimedia.org/canon.jpg", width=4000, height=3000, size=50000,
+                     mime="image/jpeg", thumburl="https://upload.wikimedia.org/preview.jpg",
+                     descriptionurl="https://commons.wikimedia.org/wiki/File:Canon.jpg",
+                     extmetadata={"LicenseShortName": {"value": "Public domain"}, "Copyrighted": {"value": "False"}})
+        merge_responses = [
+            {"results": {"bindings": [
+                {"id": {"value": "1"}, "image": {"value": "https://commons.wikimedia.org/wiki/Special:FilePath/Alias.jpg"}},
+                {"id": {"value": "2"}, "image": {"value": "https://commons.wikimedia.org/wiki/Special:FilePath/Canon.jpg"}},
+            ]}},
+            {"query": {
+                "redirects": [{"from": "File:Alias.jpg", "to": "File:Canon.jpg"}],
+                "pages": {"77": {"title": "File:Canon.jpg", "imageinfo": [image]}},
+            }},
+            {"query": {"pages": {"77": {"imageinfo": [{"thumburl": "https://upload.wikimedia.org/3840.jpg", "thumbwidth": 3840, "thumbheight": 2880}]}}}},
+        ]
+        chicago_reproductions(both, lambda url: merge_responses.pop(0), lambda: False)
+        self.assertEqual([w["original"] for w in both], ["https://upload.wikimedia.org/3840.jpg"] * 2)
+
+        # Overwriting an existing private JPEG must preserve its 0600 permissions.
+        jpeg = io.BytesIO()
+        Image.new("RGB", (50, 80), "blue").save(jpeg, format="JPEG")
+        work = dict(key="met:7", source="met", id=7, title="Private", original="https://example.org/image.jpg")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            museum, "urlopen", side_effect=lambda *a, **kw: io.BytesIO(jpeg.getvalue())
+        ):
+            preview = museum.preview_work(work, lambda: False)
+            try:
+                target = Path(tmp) / "private.jpg"
+                target.write_bytes(b"old")
+                target.chmod(0o600)
+                preview.save_copy(target, (1.0, 0.5, 0.5), lambda: False)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            finally:
+                preview.directory.cleanup()
+
+    def test_socket_backed_fetch_json_enforces_total_deadline_and_shutdown_abort(self):
+        import socket
+        import threading
+        import time
+        from framesync import museum_providers
+
+        class SocketResponse:
+            def __init__(self, sock):
+                self.fp = sock.makefile("rb")
+                self._sock = sock
+
+            def read(self, size=-1):
+                return self.fp.read(size)
+
+            def close(self):
+                self.fp.close()
+                self._sock.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+        client, server = socket.socketpair()
+        try:
+            client.settimeout(5.0)
+            server.sendall(b'{"partial": ')
+            with patch.object(museum_providers, "JSON_DEADLINE_SECONDS", 0.12), \
+                    patch.object(museum_providers, "urlopen", return_value=SocketResponse(client)):
+                started = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    museum_providers.fetch_json("https://example.org/slow.json")
+                self.assertLess(time.monotonic() - started, 0.6)
+        finally:
+            server.close()
+
+        # Cancellation must also wake a thread blocked on a real socket read immediately.
+        client2, server2 = socket.socketpair()
+        entered = threading.Event()
+        errors = []
+        try:
+            client2.settimeout(5.0)
+            server2.sendall(b'{"partial": ')
+
+            def reader(cancelled):
+                entered.set()
+                try:
+                    museum_providers.fetch_json("https://example.org/blocked.json")
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch.object(museum_providers, "urlopen", return_value=SocketResponse(client2)):
+                task = museum.MuseumTask(reader)
+                task.start()
+                self.assertTrue(entered.wait(2))
+                time.sleep(0.05)
+                started = time.monotonic()
+                task.requestInterruption()
+                self.assertTrue(task.wait(1000))
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertTrue(any(isinstance(e, InterruptedError) for e in errors))
+        finally:
+            server2.close()

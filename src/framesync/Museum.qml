@@ -297,7 +297,8 @@ ColumnLayout {
     RowLayout {
         Layout.fillWidth: true
         Layout.fillHeight: false
-        visible: page.collection.busy || page.collection.more || page.collection.message.length > 0
+        visible: page.collection.busy || page.collection.more || page.collection.message.length > 0 ||
+                 !!page.session.museumSending || !!page.collection.canShowUpload
         Label {
             Layout.fillWidth: true
             text: page.session.museumSending ? page.session.message : page.collection.message

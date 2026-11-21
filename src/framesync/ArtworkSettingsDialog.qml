@@ -14,11 +14,49 @@ FrameDialog {
     property var metadata: ({})
     property string section: "favourite"
 
+    function styleIndex() {
+        const current = dialog.metadata.matte_id || ""
+        const styles = dialog.mattes.styles || []
+        let best = -1
+        let bestLength = -1
+        for (let i = 0; i < styles.length; i++) {
+            const s = styles[i]
+            if ((current === s || current.startsWith(s + "_")) && s.length > bestLength) {
+                best = i
+                bestLength = s.length
+            }
+        }
+        return Math.max(0, best)
+    }
+    function colourIndex() {
+        const current = dialog.metadata.matte_id || ""
+        const colours = dialog.mattes.colours || []
+        let best = -1
+        let bestLength = -1
+        for (let i = 0; i < colours.length; i++) {
+            const c = colours[i]
+            if (current.endsWith("_" + c) && c.length > bestLength) {
+                best = i
+                bestLength = c.length
+            }
+        }
+        return Math.max(0, best)
+    }
+    function filterIndex() {
+        const filters = dialog.options.filters || []
+        return Math.max(0, filters.indexOf(dialog.metadata.filter_id))
+    }
+    function syncSelections() {
+        style.currentIndex = styleIndex()
+        colour.currentIndex = colourIndex()
+        filterBox.currentIndex = filterIndex()
+    }
     function showArtwork(contentId, name, details) {
         cid = contentId
         artworkTitle = name
         metadata = details || {}
         section = "favourite"
+        syncSelections()
         open()
     }
     function selectSection(name) {
@@ -69,17 +107,13 @@ FrameDialog {
                     id: style
                     model: dialog.mattes.styles
                     Accessible.name: "Matte style"
-                    currentIndex: {
-                        let current = dialog.metadata.matte_id || ""
-                        let i = model.findIndex(s => current === s || current.startsWith(s + "_"))
-                        return Math.max(0, i)
-                    }
+                    onModelChanged: currentIndex = dialog.styleIndex()
                 }
                 FrameComboBox {
                     id: colour
                     visible: !!dialog.mattes.colours.length && style.currentText !== "none"
                     model: dialog.mattes.colours
-                    currentIndex: Math.max(0, model.findIndex(c => (dialog.metadata.matte_id || "").endsWith("_" + c)))
+                    onModelChanged: currentIndex = dialog.colourIndex()
                     Accessible.name: "Matte colour"
                 }
             }
@@ -97,7 +131,7 @@ FrameDialog {
                 id: filterBox
                 visible: count > 0
                 model: dialog.options.filters || []
-                currentIndex: Math.max(0, model.indexOf(dialog.metadata.filter_id))
+                onModelChanged: currentIndex = dialog.filterIndex()
                 Accessible.name: "Photo filter"
             }
             FrameButton {

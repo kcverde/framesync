@@ -1,9 +1,133 @@
 """Paginated public-domain image searches against the museums' collection APIs."""
-import json
+from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+import json
+import socket
+import threading
+from time import monotonic
 from urllib.error import HTTPError
-from urllib.parse import unquote, urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import quote, unquote, urlencode, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+try:
+    _APP_VERSION = version("framesync")
+except PackageNotFoundError:
+    _APP_VERSION = "0.1"
+_USER_AGENT = f"FrameSync/{_APP_VERSION} (https://github.com/kcverde/framesync; Open Access artwork browser)"
+
+MAX_JSON_BYTES = 16 * 1024 * 1024
+JSON_DEADLINE_SECONDS = 15.0
+
+_REQUEST_LOCK = threading.Lock()
+_ACTIVE_RESPONSES: dict[int, set] = {}
+_CANCELLED_THREADS: set[int] = set()
+
+
+class _HttpsOnlyRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("Only HTTPS museum URLs are supported.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = build_opener(_HttpsOnlyRedirectHandler)
+
+
+def urlopen(request, timeout=None):
+    return _OPENER.open(request, timeout=timeout)
+
+
+def _response_socket(response):
+    raw = getattr(response, "fp", None)
+    inner = getattr(raw, "raw", raw)
+    return getattr(inner, "_sock", None)
+
+
+def _abort_response(response):
+    sock = _response_socket(response)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        return
+    if hasattr(response, "close"):
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def read_chunk(response, size):
+    reader = getattr(response, "read1", response.read)
+    return reader(size)
+
+
+def abort_thread_requests(thread_id: int | None):
+    if thread_id is None:
+        return
+    with _REQUEST_LOCK:
+        _CANCELLED_THREADS.add(thread_id)
+        responses = list(_ACTIVE_RESPONSES.get(thread_id, ()))
+    for response in responses:
+        _abort_response(response)
+
+
+def clear_thread_cancellation(thread_id: int):
+    with _REQUEST_LOCK:
+        _CANCELLED_THREADS.discard(thread_id)
+
+
+def is_thread_cancelled(thread_id: int | None = None) -> bool:
+    ident = threading.get_ident() if thread_id is None else thread_id
+    with _REQUEST_LOCK:
+        return ident in _CANCELLED_THREADS
+
+
+@contextmanager
+def tracked_response(response, *, deadline: float | None = None):
+    ident = threading.get_ident()
+    expired = threading.Event()
+    with _REQUEST_LOCK:
+        if ident in _CANCELLED_THREADS:
+            _abort_response(response)
+            raise InterruptedError("Museum request cancelled.")
+        _ACTIVE_RESPONSES.setdefault(ident, set()).add(response)
+    timer = None
+    if deadline is not None:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            expired.set()
+            _abort_response(response)
+            with _REQUEST_LOCK:
+                bucket = _ACTIVE_RESPONSES.get(ident)
+                if bucket is not None:
+                    bucket.discard(response)
+                    if not bucket:
+                        _ACTIVE_RESPONSES.pop(ident, None)
+            raise TimeoutError("Timed out reading response from museum service.")
+
+        def expire():
+            expired.set()
+            _abort_response(response)
+
+        timer = threading.Timer(remaining, expire)
+        timer.start()
+    try:
+        yield expired
+    finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+        with _REQUEST_LOCK:
+            bucket = _ACTIVE_RESPONSES.get(ident)
+            if bucket is not None:
+                bucket.discard(response)
+                if not bucket:
+                    _ACTIVE_RESPONSES.pop(ident, None)
 
 
 PAGE_SIZE = 12
@@ -52,12 +176,41 @@ class Filters:
 
 
 def museum_request(url):
-    return Request(url, headers={"User-Agent": "FrameSync/0.1 (Open Access artwork browser)"})
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("Only HTTPS museum URLs are supported.")
+    return Request(url, headers={"User-Agent": _USER_AGENT})
 
 
 def fetch_json(url):
-    with urlopen(museum_request(url), timeout=12) as response:
-        return json.load(response)
+    deadline = monotonic() + JSON_DEADLINE_SECONDS
+    with urlopen(museum_request(url), timeout=12) as response, tracked_response(response, deadline=deadline) as expired:
+        chunks = []
+        received = 0
+        try:
+            while True:
+                if is_thread_cancelled():
+                    raise InterruptedError("Museum search cancelled.")
+                if expired.is_set() or monotonic() > deadline:
+                    raise TimeoutError("Timed out reading response from museum service.")
+                chunk = read_chunk(response, 64 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > MAX_JSON_BYTES:
+                    raise ValueError("Museum response exceeded size limit.")
+                chunks.append(chunk)
+        except Exception as exc:
+            if is_thread_cancelled():
+                raise InterruptedError("Museum search cancelled.") from exc
+            if expired.is_set():
+                raise TimeoutError("Timed out reading response from museum service.") from exc
+            raise
+        if is_thread_cancelled():
+            raise InterruptedError("Museum search cancelled.")
+        if expired.is_set():
+            raise TimeoutError("Timed out reading response from museum service.")
+        return json.loads(b"".join(chunks))
 
 
 def record(source, object_id, title, artist, year, preview, original, link, width=0, height=0):
@@ -69,9 +222,11 @@ def record(source, object_id, title, artist, year, preview, original, link, widt
 def met_artwork(data):
     if data.get("isPublicDomain") is not True or not data.get("primaryImage"):
         return None
-    object_id = data["objectID"]
-    return record("met", object_id, data["title"], data["artistDisplayName"], data["objectDate"],
-                  data["primaryImageSmall"], data["primaryImage"],
+    object_id = data.get("objectID")
+    if object_id is None:
+        return None
+    return record("met", object_id, data.get("title"), data.get("artistDisplayName"), data.get("objectDate"),
+                  data.get("primaryImageSmall"), data["primaryImage"],
                   f"https://www.metmuseum.org/art/collection/search/{object_id}",
                   data.get("imageWidth"), data.get("imageHeight"))
 
@@ -138,10 +293,11 @@ def cleveland_search(query, offset, filters, cancelled, fetch):
         if not image or data.get("share_license_status") != "CC0":
             continue
         artists = ", ".join(c["description"] for c in data.get("creators") or [] if c.get("description"))
-        accession = data["accession_number"]
-        works.append(record("cleveland", data["id"], data["title"], artists, data["creation_date"],
+        accession = data.get("accession_number") or ""
+        link = f"https://www.clevelandart.org/art/{quote(str(accession), safe='')}" if accession else "https://www.clevelandart.org/art/collection/search"
+        works.append(record("cleveland", data["id"], data.get("title"), artists, data.get("creation_date"),
                             (images.get("web") or {}).get("url"), image["url"],
-                            f"https://www.clevelandart.org/art/{accession}", image.get("width"), image.get("height")))
+                            link, image.get("width"), image.get("height")))
     end = offset + len(page["data"])
     return SearchPage(works, end, bool(page["data"]) and end < page["info"]["total"])
 
@@ -185,18 +341,24 @@ def chicago_reproductions(works, fetch, cancelled):
                 by_file.setdefault(title, []).append(work)
         if not by_file:
             return
-        params = dict(action="query", format="json", prop="imageinfo", titles="|".join(list(by_file)[:50]),
+        params = dict(action="query", format="json", prop="imageinfo", redirects="1", titles="|".join(list(by_file)[:50]),
                       iiprop="url|size|mime|extmetadata", iiurlwidth=500,
                       iiextmetadatafilter="LicenseShortName|Copyrighted")
         result = fetch("https://commons.wikimedia.org/w/api.php?" + urlencode(params)).get("query", {})
-        for norm in result.get("normalized", []):
-            by_file[norm["to"]] = by_file.get(norm["from"], [])
+        for mapping in (*result.get("normalized", []), *result.get("redirects", [])):
+            source_works = by_file.get(mapping["from"], [])
+            if source_works:
+                target_works = by_file.setdefault(mapping["to"], [])
+                for work in source_works:
+                    if work not in target_works:
+                        target_works.append(work)
         pages = result.get("pages", {})
-        if not pages:
+        page_ids = [k for k in pages if str(k).lstrip("-").isdigit() and int(k) > 0]
+        if not page_ids:
             return
         if cancelled():
             raise InterruptedError("Museum search cancelled.")
-        sizes = dict(action="query", format="json", prop="imageinfo", pageids="|".join(k for k in pages if int(k) > 0),
+        sizes = dict(action="query", format="json", prop="imageinfo", pageids="|".join(page_ids),
                      iiprop="url", iiurlwidth=3840)
         renders = fetch("https://commons.wikimedia.org/w/api.php?" + urlencode(sizes)).get("query", {}).get("pages", {})
         for page_id, page in pages.items():

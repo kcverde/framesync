@@ -238,3 +238,74 @@ class AppTests(unittest.TestCase):
             self.assertEqual(reopened.photos[1]["framing"], [2, 1, 0])
             self.assertTrue(reopened.applyCrop(1, 1, 0.5, 0.5, True))
             self.assertFalse(reopened.photos[1]["exact"])
+
+    def test_shutdown_interrupts_and_waits_for_museum_and_tv_tasks(self):
+        import socket
+        from framesync.museum_providers import tracked_response
+
+        museum_started = Event()
+        tv_started, tv_cancelled = Event(), Event()
+        client, server = socket.socketpair()
+        client.settimeout(5.0)
+
+        class SocketResponse:
+            def __init__(self, sock):
+                self.fp = sock.makefile("rb")
+                self._sock = sock
+
+            def read(self, size=-1):
+                return self.fp.read(size)
+
+            def close(self):
+                self.fp.close()
+                self._sock.close()
+
+        try:
+            with tempfile.TemporaryDirectory() as directory, patch("framesync.tv.FrameArt", FakeTV), \
+                    patch("framesync.tv.SamsungTVWS", FakeRemote):
+                controller = Controller(Store(Path(directory)))
+                controller.setTarget("192.168.1.50", 8002)
+
+                def slow_museum(cancelled):
+                    resp = SocketResponse(client)
+                    try:
+                        with tracked_response(resp):
+                            museum_started.set()
+                            resp.read(16)
+                    finally:
+                        resp.close()
+                    return None
+
+                def slow_tv(art, task):
+                    tv_started.set()
+                    if task.cancelled.wait(5):
+                        tv_cancelled.set()
+                    return 0
+
+                controller.start_task(slow_tv, lambda _: None, "Working…")
+                self.assertTrue(tv_started.wait(2))
+                controller.start_museum_task(slow_museum, "Searching…")
+                self.assertTrue(museum_started.wait(2))
+                time.sleep(0.05)
+                started_at = time.monotonic()
+                controller.shutdown()
+                self.assertLess(time.monotonic() - started_at, 1.0)
+                self.assertTrue(tv_cancelled.is_set())
+        finally:
+            server.close()
+
+    def test_sync_failure_does_not_trigger_gallery_reload(self):
+        with tempfile.TemporaryDirectory() as directory, patch("framesync.tv.FrameArt", FakeTV), \
+                patch("framesync.tv.SamsungTVWS", FakeRemote):
+            root = Path(directory)
+            Image.new("RGB", (32, 32)).save(root / "photo.png")
+            controller, control = self.window(Store(root / "state"))
+            controller.chooseFolder(QUrl.fromLocalFile(str(root)))
+            controller.setTarget("192.168.1.50", 8002)
+            control("connect").clicked.emit()
+            self.wait_for_task(controller)
+            with patch.object(FakeTV, "upload", side_effect=TimeoutError("lost confirmation")), \
+                    patch.object(controller.gallery, "openPage") as reload_gallery:
+                control("sync").clicked.emit()
+                self.wait_for_task(controller)
+                reload_gallery.assert_not_called()

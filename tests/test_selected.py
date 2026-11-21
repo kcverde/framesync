@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
-from PySide6.QtCore import QMimeData, QObject, QPoint, QPointF, Qt, QUrl
+from PySide6.QtCore import QMimeData, QObject, QPointF, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication
 
@@ -68,7 +68,7 @@ class SelectedPhotoTests(unittest.TestCase):
             mime.setUrls([QUrl.fromLocalFile(str(outside))] * 2)
             actions = Qt.DropAction.CopyAction
             button, modifiers = Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
-            enter = QDragEnterEvent(QPoint(550, 300), actions, mime, button, modifiers)
+            enter = QDragEnterEvent(QPointF(550, 300), actions, mime, button, modifiers)
             self.app.sendEvent(window, enter)
             self.assertTrue(enter.isAccepted())
             drop = QDropEvent(QPointF(550, 300), actions, mime, button, modifiers)

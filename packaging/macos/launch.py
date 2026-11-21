@@ -1,5 +1,6 @@
 """Finder entry point for the bundled application."""
 import os
+import sys
 
 import certifi
 
@@ -9,4 +10,4 @@ from framesync.app import main
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -67,6 +67,10 @@ class Store:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root = root
         with self.connect() as db:
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                pass
             db.execute("CREATE TABLE IF NOT EXISTS uploads (tv TEXT, digest TEXT, name TEXT, content_id TEXT, PRIMARY KEY(tv, digest))")
 
             db.execute("CREATE TABLE IF NOT EXISTS removed (tv TEXT, digest TEXT, PRIMARY KEY(tv, digest))")
@@ -87,8 +91,9 @@ class Store:
 
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.root / "sync.sqlite3")
+        db = sqlite3.connect(self.root / "sync.sqlite3", timeout=5.0)
         try:
+            db.execute("PRAGMA busy_timeout=5000")
             with db:
                 yield db
         finally:

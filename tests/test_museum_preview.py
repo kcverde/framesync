@@ -247,3 +247,29 @@ class MuseumPreviewTests(unittest.TestCase):
         self.assertFalse(staged.exists())
         self.assertFalse(self.controller.uncertain)
         self.assertEqual(tv.upload.call_count, 2)
+
+    def test_save_copy_default_filename_handles_long_emoji_titles(self):
+        engine = load_window(self.controller)
+        window = engine.rootObjects()[0]
+        editor = window.findChild(QObject, "cropEditor")
+        save_button = window.findChild(QObject, "saveMuseumCopy")
+        save_dialog = window.findChild(QObject, "museumSaveDialog")
+        self.open_preview()
+        photo = dict(editor.property("photo"))
+        photo["name"] = "A" + "🎨" * 90
+        editor.setProperty("photo", photo)
+        deadline = time.monotonic() + 3
+        while not save_button.property("enabled") and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        save_button.click()
+        self.app.processEvents()
+        selected = str(save_dialog.property("selectedFile").toString())
+        self.assertTrue(selected.endswith(".jpg"))
+        self.assertIn("🎨", selected)
+        stem = Path(save_dialog.property("selectedFile").toLocalFile()).stem
+        self.assertTrue(stem.startswith("A🎨"))
+        self.assertLessEqual(len(stem.encode("utf-8")), 200)
+        save_dialog.close()
+        editor.reject()
+        window.close()

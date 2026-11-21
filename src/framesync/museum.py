@@ -5,15 +5,20 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import stat
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+import threading
+from time import monotonic
 from urllib.error import URLError
-from urllib.request import urlopen
 
 from PIL import Image, ImageFile, ImageOps
 from PySide6.QtCore import QThread
 
 from .museum_providers import (
-    Filters, MAX_IMPORT_BYTES, SOURCES, SearchPage, chicago_search, cleveland_search, fetch_json, met_search, museum_request,
+    Filters, MAX_IMPORT_BYTES, SOURCES, SearchPage, abort_thread_requests, chicago_search,
+    clear_thread_cancellation, cleveland_search, fetch_json, met_search, museum_request,
+    read_chunk, tracked_response, urlopen,
 )
 
 from .core import prepare_photo, revision
@@ -33,19 +38,29 @@ def image_size(url, cancelled):
     # PIL can parse JPEG dimensions and EXIF orientation from its initial segments.
     # Stop reading as soon as they are available, including on servers without Range support.
     parser = ImageFile.Parser()
-    with urlopen(museum_request(url), timeout=8) as source:
-        for _ in range(64):
+    deadline = monotonic() + 12.0
+    with urlopen(museum_request(url), timeout=8) as source, tracked_response(source, deadline=deadline) as expired:
+        try:
+            for _ in range(64):
+                if cancelled():
+                    raise InterruptedError("Museum search cancelled.")
+                if expired.is_set() or monotonic() > deadline:
+                    raise TimeoutError("Timed out reading image dimensions.")
+                chunk = read_chunk(source, 16384)
+                if not chunk:
+                    break
+                parser.feed(chunk)
+                if parser.image:
+                    width, height = parser.image.size
+                    if parser.image.getexif().get(274) in (5, 6, 7, 8):
+                        return height, width
+                    return width, height
+        except Exception as exc:
             if cancelled():
-                raise InterruptedError("Museum search cancelled.")
-            chunk = source.read(16384)
-            if not chunk:
-                break
-            parser.feed(chunk)
-            if parser.image:
-                width, height = parser.image.size
-                if parser.image.getexif().get(274) in (5, 6, 7, 8):
-                    return height, width
-                return width, height
+                raise InterruptedError("Museum search cancelled.") from exc
+            if expired.is_set():
+                raise TimeoutError("Timed out reading image dimensions.") from exc
+            raise
     return 0, 0
 
 
@@ -158,11 +173,35 @@ class MuseumPreview:
 
     def save_copy(self, target, framing, cancelled):
         payload = prepare_photo(self.path, self.crop(framing))
-        with NamedTemporaryFile(dir=target.parent, prefix=".framesync-", delete=False) as stream:
-            staging = Path(stream.name)
+        try:
+            existing_mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            existing_mode = None
+        if existing_mode is not None:
+            # Preserve existing destination permissions without briefly exposing private files.
+            with NamedTemporaryFile(dir=target.parent, prefix=".framesync-", delete=False) as stream:
+                staging = Path(stream.name)
+                try:
+                    stream.write(payload)
+                    stream.close()
+                    if cancelled():
+                        raise InterruptedError("Save cancelled.")
+                    os.chmod(staging, existing_mode)
+                    staging.replace(target)
+                finally:
+                    staging.unlink(missing_ok=True)
+        else:
+            # Let the OS apply the process umask atomically without mutating global umask.
+            while True:
+                staging = target.parent / f".framesync-{secrets.token_hex(6)}.tmp"
+                try:
+                    fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                    break
+                except FileExistsError:
+                    continue
             try:
-                stream.write(payload)
-                stream.close()
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
                 if cancelled():
                     raise InterruptedError("Save cancelled.")
                 staging.replace(target)
@@ -190,16 +229,30 @@ def import_work(work, folder, cancelled, local_file=None):
     with NamedTemporaryFile(dir=folder, prefix=".framesync-", suffix=".part", delete=False) as temp:
         staging = Path(temp.name)
     try:
+        deadline = None if local_file else monotonic() + 60.0
         source_file = local_file.open("rb") if local_file else urlopen(museum_request(work["original"]), timeout=15)
-        with source_file as source, staging.open("wb") as output:
+        with source_file as source, tracked_response(source, deadline=deadline) as expired, staging.open("wb") as output:
             received = 0
-            while chunk := source.read(128 * 1024):
-                received += len(chunk)
-                if received > MAX_IMPORT_BYTES:
-                    raise ValueError("This source image exceeds the 128 MB import limit.")
+            try:
+                while chunk := read_chunk(source, 128 * 1024):
+                    received += len(chunk)
+                    if received > MAX_IMPORT_BYTES:
+                        raise ValueError("This source image exceeds the 128 MB import limit.")
+                    if cancelled():
+                        raise InterruptedError("Artwork download cancelled.")
+                    if expired.is_set() or (deadline is not None and monotonic() > deadline):
+                        raise TimeoutError("Timed out downloading artwork from museum service.")
+                    output.write(chunk)
+            except Exception as exc:
                 if cancelled():
-                    raise InterruptedError("Artwork download cancelled.")
-                output.write(chunk)
+                    raise InterruptedError("Artwork download cancelled.") from exc
+                if expired.is_set():
+                    raise TimeoutError("Timed out downloading artwork from museum service.") from exc
+                raise
+            if cancelled():
+                raise InterruptedError("Artwork download cancelled.")
+            if expired.is_set():
+                raise TimeoutError("Timed out downloading artwork from museum service.")
         with Image.open(staging) as image:
             image.load()
             if image.format != "JPEG":
@@ -229,9 +282,26 @@ class MuseumTask(QThread):
         self.operation = operation
         self.result = None
         self.error = ""
+        self._thread_lock = threading.Lock()
+        self._thread_id = None
+
+    def requestInterruption(self):
+        super().requestInterruption()
+        with self._thread_lock:
+            thread_id = self._thread_id
+        abort_thread_requests(thread_id)
 
     def run(self):
+        ident = threading.get_ident()
+        with self._thread_lock:
+            self._thread_id = ident
+        if self.isInterruptionRequested():
+            abort_thread_requests(ident)
         try:
             self.result = self.operation(self.isInterruptionRequested)
         except Exception as exc:
             self.error = str(exc) or type(exc).__name__
+        finally:
+            clear_thread_cancellation(ident)
+            with self._thread_lock:
+                self._thread_id = None

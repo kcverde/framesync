@@ -100,6 +100,7 @@ class Controller(QObject):
         self.paths = []
         self.rows = []
         self.paired = False
+        self._shutting_down = False
         self.task = None
         self.tv_lock = threading.Lock()
         self.gallery_task = None
@@ -234,6 +235,7 @@ class Controller(QObject):
     def start_museum_task(self, operation, message):
         self.last_museum_upload = None
         self.museum_task = museum.MuseumTask(operation)
+        self.museum_task.setParent(self)
         self.museum_task.finished.connect(self.finish_museum_task)
         self.museum_message = message
         self.museumChanged.emit()
@@ -383,9 +385,12 @@ class Controller(QObject):
 
     @Slot()
     def finish_museum_task(self):
-        task = self.museum_task
+        task = self.sender() or self.museum_task
+        if task is not None:
+            task.deleteLater()
+        if self._shutting_down or task is not self.museum_task:
+            return
         self.museum_task = None
-        task.deleteLater()
         self.museum_message = task.error
         photo = None
         if isinstance(task.result, museum.SearchPage):
@@ -408,8 +413,9 @@ class Controller(QObject):
         elif isinstance(task.result, Path):
             self.museum_message = f"Saved cropped copy to {task.result.name}."
             try:
-                self.museum_library.remember_import(task.result, self.museum_preview.key)
-                if self.folder and task.result.parent == self.folder:
+                if self.museum_preview:
+                    self.museum_library.remember_import(task.result, self.museum_preview.key)
+                if self.folder and task.result.parent.resolve() == self.folder.resolve():
                     self.load_folder(self.folder)
             except (OSError, ValueError, sqlite3.Error) as exc:
                 self.museum_message += f" Could not update the local library: {exc}"
@@ -660,6 +666,7 @@ class Controller(QObject):
         resume_gallery = self.gallery_task is not None
         self.cancel_gallery()
         self.task = Task(self.store, host, self.port, operation, completed, syncing, self.tv_lock)
+        self.task.setParent(self)
         self.task.resume_gallery = resume_gallery
         self.task.progress.connect(self.progress)
         self.task.status.connect(self.set_message)
@@ -694,11 +701,23 @@ class Controller(QObject):
         self.changed.emit()
 
     def shutdown(self):
+        self._shutting_down = True
         self.cancel_reconnect()
-        self.discardMuseumPreview()
         self.cancel_gallery()
-        for task in self.findChildren(Task):
-            task.wait()
+        if self.task:
+            self.task.cancelled.set()
+        if self.museum_task:
+            self.museum_task.requestInterruption()
+        for thread in self.findChildren(QThread):
+            thread.wait()
+        if self.museum_preview:
+            self.museum_preview.directory.cleanup()
+            self.museum_preview = None
+        if self.task and self.task.museum_preview:
+            self.task.museum_preview.directory.cleanup()
+            self.task.museum_preview = None
+        self.task = None
+        self.museum_task = None
 
     @Slot(int, int, str)
     def progress(self, done, total, message):
@@ -712,8 +731,12 @@ class Controller(QObject):
 
     @Slot()
     def finished(self):
-        task, self.task = self.task, None
-        task.deleteLater()
+        task = self.sender() or self.task
+        if task is not None:
+            task.deleteLater()
+        if self._shutting_down or task is not self.task:
+            return
+        self.task = None
         if task.museum_preview:
             task.museum_preview.directory.cleanup()
         if task.syncing:
@@ -731,7 +754,7 @@ class Controller(QObject):
         else:
             self.message = ""
             task.completed(task.output)
-        if self.paired and (task.syncing or task.resume_gallery):
+        if not task.error and self.paired and (task.syncing or task.resume_gallery):
             self.gallery.openPage()
         self.changed.emit()
 
@@ -768,11 +791,12 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("FrameSync")
     root = Path.home() / "Library" / "Application Support" / "FrameSync"
-    store = Store(root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = QLockFile(str(root / "app.lock"))
     if not lock.tryLock(0):
         QMessageBox.information(None, "FrameSync is already open", "Use the existing FrameSync window.")
         return
+    store = Store(root)
     controller = Controller(store)
     engine = load_window(controller)
     result = app.exec()

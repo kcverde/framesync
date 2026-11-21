@@ -9,6 +9,7 @@ from time import monotonic
 
 from PIL import Image
 from PySide6.QtCore import QObject, Property, Signal, Slot
+from samsungtvws.exceptions import ConnectionFailure
 
 from .core import artwork_list
 from .tv import call_tv
@@ -36,19 +37,24 @@ def thumbnails(art, ids):
         return {}
     try:
         images = call_tv(art, art.get_thumbnail_list, ids)
+    except (TimeoutError, OSError, ConnectionFailure, InterruptedError):
+        raise
     except Exception:
         # Some models provide an individual thumbnail command only.
         try:
             images = call_tv(art, art.get_thumbnail, ids, as_dict=True)
+        except (TimeoutError, OSError, ConnectionFailure, InterruptedError):
+            raise
         except Exception:
             return {}
     if not isinstance(images, dict):
         return {}
+    id_set = set(ids)
     previews = {}
     for key, raw in images.items():
         # Newer TVs include a filename extension in the D2D response.
-        cid = key if key in ids else str(key).rpartition(".")[0]
-        if cid in ids:
+        cid = key if key in id_set else str(key).rpartition(".")[0]
+        if cid in id_set:
             previews[cid] = thumbnail_url(raw)
     return previews
 
@@ -95,10 +101,15 @@ def _catalog(art, store, host, items=None):
     return items, receipts, ids, current, message
 
 
-def _read_page(art, page, items, receipts, ids, current, message):
+def _read_page(art, page, items, receipts, ids, current, message, *, ignore_thumbnail_errors=False):
     page = max(0, min(page, (len(items) - 1) // PAGE_SIZE))
     entries = items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-    previews = thumbnails(art, [str(item["content_id"]) for item in entries])
+    try:
+        previews = thumbnails(art, [str(item["content_id"]) for item in entries])
+    except (TimeoutError, OSError, ConnectionFailure):
+        if not ignore_thumbnail_errors:
+            raise
+        previews = {}
     rows = []
     for item in entries:
         cid = str(item["content_id"])
@@ -110,8 +121,8 @@ def _read_page(art, page, items, receipts, ids, current, message):
     return FramePage(rows, ids, page, current, message)
 
 
-def frame_page(art, store, host, page=0, *, items=None):
-    return _read_page(art, page, *_catalog(art, store, host, items))
+def frame_page(art, store, host, page=0, *, items=None, ignore_thumbnail_errors=False):
+    return _read_page(art, page, *_catalog(art, store, host, items), ignore_thumbnail_errors=ignore_thumbnail_errors)
 
 
 def load_gallery(art, task):
@@ -135,7 +146,7 @@ def show_artwork(art, store, host, page, cid):
         result.message = "This artwork is no longer on the Frame."
         return result
     call_tv(art, art.select_image, cid, category=item.get("category_id"), show=True)
-    result = frame_page(art, store, host, page, items=items)
+    result = frame_page(art, store, host, page, items=items, ignore_thumbnail_errors=True)
     if result.current != cid:
         result.message = "Display requested. Refresh to check what is showing."
     return result
@@ -163,7 +174,7 @@ def remove_artwork(art, store, host, page, cid, identity):
                 store.undo_removal_intent(host, added_marks)
             raise RuntimeError("The artwork is still on the Frame. Check the TV and refresh.")
     store.confirm_removal(host, cid)
-    result = frame_page(art, store, host, page, items=items)
+    result = frame_page(art, store, host, page, items=items, ignore_thumbnail_errors=True)
     result.message = "Removed from this Frame."
     return result
 

@@ -26,7 +26,7 @@ FrameDialog {
         open()
     }
     anchors.centerIn: parent
-    width: Math.min(610, parent.width - 48, (parent.height - (museumPreview ? 350 : 320)) * 16 / 9)
+    width: Math.max(320, Math.min(610, parent.width - 48, (parent.height - (museumPreview ? 350 : 320)) * 16 / 9))
     modal: true
     closePolicy: saving ? Popup.NoAutoClose : Popup.CloseOnEscape | Popup.CloseOnPressOutside
     title: museumPreview ? "Preview & crop" : "Crop to 4K"
@@ -195,8 +195,25 @@ FrameDialog {
                 enabled: preview.ready && !editor.saving
                 text: "Save a copy…"
                 onClicked: {
-                    const folder = StandardPaths.writableLocation(StandardPaths.PicturesLocation)
-                    const name = editor.photo.name.replace(/[\/:]/g, "-").replace(/\.jpe?g$/i, "")
+                    const folder = String(StandardPaths.writableLocation(StandardPaths.PicturesLocation)).replace(/\/+$/, "")
+                    const cleaned = editor.photo.name.replace(/[\/:]/g, "-").replace(/\.jpe?g$/i, "")
+                    let truncated = ""
+                    let count = 0
+                    let bytes = 0
+                    for (let i = 0; i < cleaned.length && count < 80; ) {
+                        const cp = cleaned.codePointAt(i)
+                        const step = cp > 0xFFFF ? 2 : 1
+                        if (cp < 0xD800 || cp > 0xDFFF) {
+                            const utf8Len = cp <= 0x7F ? 1 : cp <= 0x7FF ? 2 : cp <= 0xFFFF ? 3 : 4
+                            if (bytes + utf8Len > 200)
+                                break
+                            truncated += cleaned.slice(i, i + step)
+                            count += 1
+                            bytes += utf8Len
+                        }
+                        i += step
+                    }
+                    const name = truncated.trim() || "Artwork"
                     saveCopy.selectedFile = folder + "/" + encodeURIComponent(name + ".jpg")
                     saveCopy.open()
                 }

@@ -24,6 +24,12 @@ FrameDialog {
         if (slide.category && !ids.includes(slide.category)) ids.push(slide.category)
         return ids
     }
+    function syncSlideshow() {
+        duration.value = slide.minutes || 0
+        collection.currentIndex = Math.max(0, collection.ids.indexOf(slide.category))
+        shuffle.checked = !!slide.shuffle
+    }
+    onSlideChanged: Qt.callLater(syncSlideshow)
 
     parent: Overlay.overlay
     anchors.centerIn: parent

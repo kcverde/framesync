@@ -230,3 +230,36 @@ class GalleryTests(unittest.TestCase):
         second = self.art.ids[-1]
         self.assertCountEqual(self.store.upload_paths(self.host),
                               [(str(self.photo), first), (str(copy), first), (str(self.photo), second)])
+
+    def test_thumbnail_timeout_propagates_instead_of_falling_back(self):
+        from framesync.gallery import thumbnails
+
+        self.art.get_thumbnail_list = Mock(side_effect=TimeoutError("timed out"))
+        self.art.get_thumbnail = Mock()
+        with self.assertRaises(TimeoutError):
+            thumbnails(self.art, ["builtin"])
+        self.art.get_thumbnail.assert_not_called()
+
+    def test_thumbnail_timeout_after_confirmed_delete_or_show_still_succeeds(self):
+        self.sync()
+        cid = self.art.ids[-1]
+        identity = self.identity(cid)
+        self.art.get_thumbnail_list = Mock(side_effect=TimeoutError("thumbs timed out"))
+        shown = show_artwork(self.art, self.store, self.host, 0, cid)
+        self.assertEqual(shown.current, cid)
+        self.assertEqual(shown.rows[-1]["thumb"], "")
+
+        # Restore thumbnail read for pre-delete identity verification, then fail only post-delete refresh.
+        calls = {"count": 0}
+        thumb_bytes = self.art.thumb.getvalue()
+
+        def fail_second_thumb(ids):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return {item + ".jpg": thumb_bytes for item in ids}
+            raise TimeoutError("post-delete thumbs timed out")
+
+        self.art.get_thumbnail_list = fail_second_thumb
+        removed = remove_artwork(self.art, self.store, self.host, 0, cid, identity)
+        self.assertNotIn(cid, removed.ids)
+        self.assertIn("Removed", removed.message)

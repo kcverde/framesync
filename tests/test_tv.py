@@ -150,6 +150,75 @@ class PairingTests(unittest.TestCase):
             finally:
                 art.close()
 
+    def test_upload_has_a_deadline(self):
+        aborted = threading.Event()
+        d2d_closed = threading.Event()
+        art = FrameArt(self.host, port=8002, token="saved", timeout=0.05)
+        sock = TVSocket([{"event": "ms.channel.connect"}, {"event": "ms.channel.ready"}])
+        sock.abort = aborted.set
+
+        class FakeD2DSocket:
+            def settimeout(self, value):
+                pass
+
+            def shutdown(self, how):
+                d2d_closed.set()
+
+            def close(self):
+                d2d_closed.set()
+
+        def silent_upload(*args, **kwargs):
+            with patch.object(SamsungTVArt, "_open_d2d_socket", return_value=FakeD2DSocket()):
+                art._open_d2d_socket({"ip": self.host, "port": 1234})
+            if not d2d_closed.wait(0.5):
+                self.fail("D2D socket was never closed on upload deadline")
+            return "late-content-id"
+
+        with patch("samsungtvws.connection.websocket.create_connection", return_value=sock):
+            try:
+                art.open()
+                with patch.object(SamsungTVArt, "upload", silent_upload):
+                    with self.assertRaisesRegex(TimeoutError, "uploading artwork"):
+                        art.upload(b"jpeg-bytes", file_type="JPEG")
+                self.assertTrue(aborted.is_set())
+                self.assertTrue(d2d_closed.is_set())
+            finally:
+                art.close()
+
+    def test_call_tv_aborts_stalled_d2d_socket_for_thumbnails(self):
+        from framesync.tv import call_tv
+
+        d2d_closed = threading.Event()
+        art = FrameArt(self.host, port=8002, token="saved", timeout=0.05)
+        sock = TVSocket([{"event": "ms.channel.connect"}, {"event": "ms.channel.ready"}])
+
+        class FakeD2DSocket:
+            def settimeout(self, value):
+                pass
+
+            def shutdown(self, how):
+                d2d_closed.set()
+
+            def close(self):
+                d2d_closed.set()
+
+        def stalled_thumbs(ids):
+            with patch.object(SamsungTVArt, "_open_d2d_socket", return_value=FakeD2DSocket()):
+                art._open_d2d_socket({"ip": self.host, "port": 1234})
+            if not d2d_closed.wait(0.5):
+                self.fail("D2D socket was never aborted on call_tv deadline")
+            raise OSError("D2D socket aborted")
+
+        with patch("samsungtvws.connection.websocket.create_connection", return_value=sock):
+            try:
+                art.open()
+                with patch.object(art, "get_thumbnail_list", side_effect=stalled_thumbs):
+                    with self.assertRaisesRegex(TimeoutError, "timed out"):
+                        call_tv(art, art.get_thumbnail_list, ["x"])
+                self.assertTrue(d2d_closed.is_set())
+            finally:
+                art.close()
+
     def test_legacy_port_does_not_require_remote_pairing(self):
         def legacy(url, timeout, **kwargs):
             self.calls.append(url)

@@ -153,12 +153,23 @@ ApplicationWindow {
                         onTextEdited: backend.setTarget(text, win.session.port)
                     }
                     FrameComboBox {
+                        id: portCombo
                         Layout.fillWidth: true
                         enabled: !win.session.busy
                         Accessible.name: "Connection port"
                         model: ["Secure · 8002", "Legacy · 8001"]
                         currentIndex: win.session.port === 8001 ? 1 : 0
                         onActivated: backend.setTarget(host.text, currentIndex === 1 ? 8001 : 8002)
+                    }
+                    Connections {
+                        target: win.backend
+                        function onChanged() {
+                            if (host.text !== win.session.host)
+                                host.text = win.session.host
+                            const portIndex = win.session.port === 8001 ? 1 : 0
+                            if (portCombo.currentIndex !== portIndex)
+                                portCombo.currentIndex = portIndex
+                        }
                     }
                     FrameButton { objectName: "connect"; text: win.session.reconnecting ? "Reconnecting…" : "Connect"; enabled: !win.session.busy && !win.session.reconnecting; onClicked: backend.launch(false) }
                 }
