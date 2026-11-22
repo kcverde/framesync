@@ -12,9 +12,12 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, __version__ as pillow_version, features
 
 EXTENSIONS = {".jpg", ".jpeg", ".png"}
+# Bump the recipe version whenever photo preparation changes its output.
+ENCODER_VERSION = json.dumps((1, pillow_version, features.version_codec("jpg"),
+                              features.version_feature("libjpeg_turbo")))
 
 
 def validate_host(value: str) -> str:
@@ -47,8 +50,12 @@ def crop_box(size, zoom, pan_x, pan_y):
 
 
 def prepare_photo(path: Path, crop=None) -> bytes:
-    # Read once so the hash always describes the exact bytes sent to the TV.
-    with path.open("rb") as source, Image.open(source) as original:
+    with path.open("rb") as source:
+        return _prepare_photo(source, crop)
+
+
+def _prepare_photo(source, crop) -> bytes:
+    with Image.open(source) as original:
         image = ImageOps.exif_transpose(original).convert("RGBA")
         if crop and crop[0] == revision(os.fstat(source.fileno())):
             box = crop_box(image.size, *crop[1:])
@@ -60,6 +67,10 @@ def prepare_photo(path: Path, crop=None) -> bytes:
         output = io.BytesIO()
         canvas.save(output, "JPEG", quality=90)
         return output.getvalue()
+
+
+def _source_revision(stat):
+    return json.dumps((stat.st_dev, stat.st_ino, stat.st_ctime_ns, revision(stat)))
 
 
 class Store:
@@ -77,6 +88,18 @@ class Store:
             db.execute("CREATE TABLE IF NOT EXISTS upload_paths (tv TEXT, digest TEXT, path TEXT, PRIMARY KEY(tv, digest, path))")
             db.execute("CREATE TABLE IF NOT EXISTS museum_sends (tv TEXT, digest TEXT, work_key TEXT, PRIMARY KEY(tv, digest, work_key))")
             db.execute("CREATE TABLE IF NOT EXISTS crops (path TEXT PRIMARY KEY, revision TEXT, zoom REAL, x REAL, y REAL)")
+            db.execute("""CREATE TABLE IF NOT EXISTS prepared_digests (
+                path TEXT PRIMARY KEY, revision TEXT, crop TEXT, encoder TEXT, digest TEXT)""")
+
+    def prepared_digest(self, key):
+        with self.connect() as db:
+            row = db.execute("""SELECT digest FROM prepared_digests
+                                WHERE path=? AND revision=? AND crop=? AND encoder=?""", key).fetchone()
+            return row[0] if row else None
+
+    def cache_prepared_digest(self, key, digest):
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO prepared_digests VALUES (?, ?, ?, ?, ?)", (*key, digest))
 
     def crops(self):
         with self.connect() as db:
@@ -221,8 +244,21 @@ def sync_files(art, store: Store, tv: str, paths: list[Path], cancelled: threadi
         if cancelled.is_set():
             return summary("Stopped.")
         progress(index, len(paths), f"Preparing {path.name}")
-        payload = prepare_photo(path, crops.get(str(path)))
-        digest = hashlib.sha256(payload).hexdigest()
+        crop = crops.get(str(path))
+        stamp = _source_revision(path.stat())
+        cache_path, cache_crop = str(path.absolute()), json.dumps(crop)
+        digest = store.prepared_digest((cache_path, stamp, cache_crop, ENCODER_VERSION))
+        previous = records.get(digest)
+        suppressed = digest in removed and not resend
+        already_synced = previous and previous[1] in existing
+        if not (suppressed or already_synced) or _source_revision(path.stat()) != stamp:
+            with path.open("rb") as source:
+                stamp = _source_revision(os.fstat(source.fileno()))
+                # Rehash any payload that could be sent, then look up its actual digest.
+                payload = _prepare_photo(source, crop)
+                digest = hashlib.sha256(payload).hexdigest()
+                if _source_revision(os.fstat(source.fileno())) == stamp:
+                    store.cache_prepared_digest((cache_path, stamp, cache_crop, ENCODER_VERSION), digest)
         previous = records.get(digest)
         if digest in removed and not resend:
             excluded += 1

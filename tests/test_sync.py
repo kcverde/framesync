@@ -1,11 +1,14 @@
+import hashlib
 import io
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 
+from framesync import core
 from framesync.core import Store, photos_in, prepare_photo, revision, sync_folder, validate_host
 
 
@@ -58,6 +61,54 @@ class SyncTests(unittest.TestCase):
         self.art.ids = {"existing-art"}
         self.assertIn("1 added", self.sync())
         self.assertEqual(len(self.art.sent), 2)
+
+    def test_cached_digest_skips_preparation_after_restart_and_removal(self):
+        self.assertIn("1 added", self.sync())
+        self.store = Store(self.root / "state")
+        with patch.object(core, "_prepare_photo", side_effect=AssertionError("unexpected encoding")):
+            self.assertIn("1 already synced", self.sync())
+            self.store.mark_removing("192.168.1.50", "photo-0")
+            self.store.confirm_removal("192.168.1.50", "photo-0")
+            self.art.ids.remove("photo-0")
+            self.assertIn("1 previously removed", self.sync())
+        self.assertEqual(len(self.art.sent), 1)
+
+    def test_upload_uses_digest_of_new_payload_even_with_cached_digest(self):
+        self.sync()
+        self.art.ids.remove("photo-0")
+        payload = b"newly prepared bytes"
+        with patch.object(core, "_prepare_photo", return_value=payload) as prepare:
+            self.assertIn("1 added", self.sync())
+        prepare.assert_called_once()
+        self.assertEqual(self.art.sent[-1], payload)
+        self.assertIn(hashlib.sha256(payload).hexdigest(), self.store.records("192.168.1.50"))
+
+    def test_encoder_version_change_requires_preparation(self):
+        self.sync()
+        with patch.object(core, "ENCODER_VERSION", "new version"), patch.object(
+            core, "_prepare_photo", wraps=core._prepare_photo
+        ) as prepare:
+            self.assertIn("1 already synced", self.sync())
+        prepare.assert_called_once()
+
+    def test_symlink_retargeted_during_cache_lookup_is_prepared(self):
+        original = self.root / "original.png"
+        replacement = self.root / "replacement.png"
+        self.photo.rename(original)
+        Image.new("RGB", (200, 100), "blue").save(replacement)
+        self.photo.symlink_to(original)
+        self.assertIn("1 added", self.sync())
+        lookup = self.store.prepared_digest
+
+        def retarget(key):
+            digest = lookup(key)
+            self.photo.unlink()
+            self.photo.symlink_to(replacement)
+            return digest
+
+        with patch.object(self.store, "prepared_digest", side_effect=retarget):
+            self.assertIn("1 added", self.sync())
+        self.assertEqual(self.art.sent[-1], prepare_photo(replacement))
 
     def test_lost_confirmation_blocks_retry_across_restart(self):
         self.art.fail = True
