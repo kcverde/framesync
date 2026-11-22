@@ -17,7 +17,7 @@ from PySide6.QtCore import QThread
 from urllib3.exceptions import HTTPError as PooledHTTPError
 
 from .museum_providers import (
-    Filters, MAX_IMPORT_BYTES, SOURCES, SearchPage, abort_thread_requests, chicago_search,
+    Filters, MAX_IMPORT_BYTES, SOURCES as SOURCES, SearchPage, abort_thread_requests, chicago_search,
     clear_thread_cancellation, cleveland_search, fetch_json, met_search, museum_request,
     read_chunk, tracked_response, urlopen,
 )

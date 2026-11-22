@@ -94,6 +94,41 @@ class AppTests(unittest.TestCase):
             window.setTarget("192.168.1.51", 8002)
             self.assertFalse(control("sync").property("enabled"))
 
+    def test_manage_photos_refreshes_folder_and_clears_only_ui_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "photos"
+            folder.mkdir()
+            removed = folder / "removed.jpg"
+            retained = folder / "retained.jpg"
+            extra = root / "extra.jpg"
+            for photo in (removed, retained, extra):
+                Image.new("RGB", (32, 20)).save(photo)
+
+            controller, control = self.window(Store(root / "state"))
+            controller.chooseFolder(QUrl.fromLocalFile(str(folder)))
+            controller.addPhotos([QUrl.fromLocalFile(str(extra)), QUrl.fromLocalFile(str(removed))])
+            controller.selectPhoto(controller.paths.index(retained), True)
+            added = folder / "new.jpg"
+            Image.new("RGB", (40, 30)).save(added)
+            removed.unlink()
+
+            control("managePhotos").click()
+            self.app.processEvents()
+            control("refreshFolder").triggered.emit()
+            self.assertEqual(set(controller.paths), {added, retained, extra})
+            self.assertEqual(controller.selected, {retained, extra})
+
+            control("clearAddedPhotos").triggered.emit()
+            self.assertEqual(set(controller.paths), {added, retained})
+            self.assertEqual(controller.selected, {retained})
+            self.assertTrue(extra.is_file())
+
+            control("clearSelection").triggered.emit()
+            self.assertFalse(controller.selected)
+            self.assertEqual(controller.folder, folder)
+            self.assertEqual(set(folder.iterdir()), {added, retained})
+
     def test_gallery_preloads_while_browsing_and_joins_the_existing_read(self):
         from framesync.gallery import load_gallery
 
@@ -291,7 +326,7 @@ class AppTests(unittest.TestCase):
 
                 controller.start_task(slow_tv, lambda _: None, "Working…")
                 self.assertTrue(tv_started.wait(2))
-                controller.start_museum_task(slow_museum, "Searching…")
+                controller.museum.start_museum_task(slow_museum, "Searching…")
                 self.assertTrue(museum_started.wait(2))
                 time.sleep(0.05)
                 started_at = time.monotonic()

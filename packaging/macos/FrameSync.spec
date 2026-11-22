@@ -1,4 +1,4 @@
-from importlib.metadata import distribution, version
+from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 import sysconfig
 
@@ -12,7 +12,11 @@ data = collect_data_files("framesync") + [
 ]
 for package in ("PySide6-Essentials", "shiboken6", "Pillow", "samsungtvws", "websocket-client",
                 "requests", "certifi", "urllib3", "charset-normalizer", "idna", "yarl", "propcache", "multidict", "PyInstaller"):
-    dist = distribution(package)
+    try:
+        dist = distribution(package)
+    except PackageNotFoundError:
+        # An optional or transitive dependency can disappear when uv.lock changes.
+        continue
     for file in dist.files or ():
         if "license" in str(file).lower() and ".dist-info/" in str(file) and file.name != "RECORD":
             data.append((str(dist.locate_file(file)), f"notices/{package}"))

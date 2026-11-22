@@ -63,7 +63,7 @@ ColumnLayout {
         onAccepted: page.gallery.remove(artwork.cid, artwork.identity)
     }
 
-    Label { text: "On the Frame"; font.family: "Asul"; font.pixelSize: 36 }
+    Label { text: "On the Frame"; font.family: FrameTheme.headingFont; font.pixelSize: 36 }
     RowLayout {
         Layout.fillWidth: true
         Label {

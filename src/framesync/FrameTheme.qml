@@ -2,6 +2,10 @@ pragma Singleton
 import QtQuick
 
 QtObject {
+    readonly property FontLoader bodyLoader: FontLoader { source: "fonts/atkinson.woff2" }
+    readonly property FontLoader headingLoader: FontLoader { source: "fonts/asul.woff2" }
+    readonly property string bodyFont: bodyLoader.name
+    readonly property string headingFont: headingLoader.name
     property bool dark: Qt.styleHints.colorScheme === Qt.Dark
     readonly property color canvas: dark ? "#111121" : "#f1edf7"
     readonly property color side: dark ? "#171628" : "#f9f5fb"

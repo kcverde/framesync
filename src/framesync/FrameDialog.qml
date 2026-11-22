@@ -11,7 +11,7 @@ Dialog {
         rightPadding: dialog.padding
         topPadding: dialog.padding
         text: dialog.title
-        font.family: "Asul"
+        font.family: FrameTheme.headingFont
         font.pixelSize: 24
         wrapMode: Text.WordWrap
     }

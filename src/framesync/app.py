@@ -1,32 +1,31 @@
 from __future__ import annotations
 
-from functools import partial
 from pathlib import Path
 import sqlite3
 import sys
 import threading
-from urllib.error import URLError
 
 from PIL import Image
 from PySide6.QtCore import QObject, Property, QLockFile, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 from .core import EXTENSIONS, Store, content_ids, photos_in, revision, sync_files, sync_folder, validate_host
-from .gallery import Gallery, show_artwork
+from .gallery import Gallery
 from .frame_settings import FrameSettings
 from .tv import ReadCancellation, artwork_connection
-from . import museum
+from .museum_controller import MuseumController
 
 
 class Task(QThread):
     progress = Signal(int, int, str)
     status = Signal(str)
 
-    def __init__(self, store, host, port, operation, completed, syncing, tv_lock, *, reconnect=False, read_only=False):
+    def __init__(self, store, host, port, operation, completed, syncing, tv_lock, *, reconnect=False, read_only=False, failed=None):
         super().__init__()
         self.store, self.host, self.port = store, host, port
         self.operation = operation
         self.completed = completed
+        self.failed = failed
         self.syncing = syncing
         self.tv_lock = tv_lock
         self.reconnect = reconnect
@@ -35,8 +34,6 @@ class Task(QThread):
         self.output = None
         self.error = ""
         self.content_snapshot = None
-        self.showing_museum_upload = False
-        self.museum_preview = None
 
     def snapshot(self, ids):
         self.content_snapshot = set(ids)
@@ -88,10 +85,6 @@ class Controller(QObject):
     changed = Signal()
     photosChanged = Signal()
     selectionChanged = Signal()
-    museumChanged = Signal()
-    museumPreviewReady = Signal("QVariantMap")
-    museumPreviewSaved = Signal()
-    museumFileNeeded = Signal(str, str, str)
 
     def __init__(self, store):
         super().__init__()
@@ -120,20 +113,8 @@ class Controller(QObject):
         self.tv_lock = threading.Lock()
         self.gallery_task = None
         self.gallery_message = ""
-        self.museum_task = None
-        self.museum_preview = None
-        self.last_museum_upload = None
-        self.museum_library = museum.MuseumLibrary(store)
-        self.saved_works = self.museum_library.saved()
-        self.museum_on_frame = set()
-        self.featured_source = ""
-        self.museum_view = "Featured"
-        self.museum_filters = museum.Filters()
-        self.works = museum.featured_works()
-        self.search_query = ""
-        self.next_offset = 0
-        self.more = False
-        self.museum_message = ""
+        self._museum = MuseumController(self)
+        self._museum.changed.connect(self.changed)
         self.message = "Connect your TV to start syncing."
         self.done = self.total = 0
         self.uncertain = []
@@ -176,15 +157,18 @@ class Controller(QObject):
     def frameSettings(self):
         return self._frame_settings
 
+    @Property(QObject, constant=True)
+    def museum(self):
+        return self._museum
+
     @Property("QVariantMap", notify=changed)
     def state(self):
-        return dict(host=self.host, port=self.port, paired=self.paired, knownTarget=self.known_target, reconnecting=self.reconnect_task is not None, busy=bool(self.task or self.museum_task),
-                    museumSending=bool(self.task and self.task.museum_preview),
+        return dict(host=self.host, port=self.port, paired=self.paired, knownTarget=self.known_target, reconnecting=self.reconnect_task is not None, busy=bool(self.task or self._museum.museum_task),
                     connecting=bool(self.task and self.task.read_cancellation is not None),
                     galleryLoading=self.gallery_task is not None, galleryMessage=self.gallery_message,
                     syncing=bool(self.task and self.task.syncing), folder=str(self.folder or ""),
-                    selectedCount=len(self.selected), folderCount=len(self.folder_paths),
-                    ready=self.paired and bool(self.folder_paths) and not (self.task or self.museum_task) and not self.uncertain,
+                    selectedCount=len(self.selected), folderCount=len(self.folder_paths), addedCount=len(self.extra_paths),
+                    ready=self.paired and bool(self.folder_paths) and not (self.task or self._museum.museum_task) and not self.uncertain,
                     message=self.message, done=self.done, total=self.total, uncertain=self.uncertain)
 
     @Property("QVariantMap", notify=selectionChanged)
@@ -195,268 +179,20 @@ class Controller(QObject):
     def photos(self):
         return self.rows
 
-    @Property("QVariantMap", notify=museumChanged)
-    def collection(self):
-        works = self.saved_works.values() if self.museum_view == "Saved" else self.works
-        rows = [
-            dict(work, saved=work["key"] in self.saved_works, onFrame=work["key"] in self.museum_on_frame,
-                 fit=museum.fit_label(work["width"], work["height"]), museum=museum.SOURCES[work["source"]])
-            for work in works
-        ]
-        return dict(works=rows, query=self.search_query, more=self.more and self.museum_view == "Results",
-                    featuredMuseum=museum.SOURCES.get(self.featured_source, "All museums"),
-                    view=self.museum_view, message=self.museum_message, busy=bool(self.museum_task),
-                    canShowUpload=self.last_museum_upload is not None)
-
-    def updateMuseumOnFrame(self, content_ids):
-        if self.last_museum_upload and self.last_museum_upload[1] not in content_ids:
-            self.last_museum_upload = None
-            self.museum_message = "This crop is no longer on the Frame." if self.paired else ""
-        self.museum_on_frame = self.museum_library.keys_on_tv(self.host.strip(), set(content_ids))
-        self.museumChanged.emit()
-
-    @Slot(str)
-    @Slot(str, str)
-    def museumView(self, view, source=""):
-        if self.museum_task or view not in ("Featured", "Saved") or (source and source not in museum.SOURCES):
-            return
-        self.last_museum_upload = None
-        self.museum_view = view
-        self.museum_message = ""
-        if view == "Featured":
-            self.featured_source = source
-            self.works = museum.featured_works(source)
-            self.search_query = ""
-            self.more = False
-        self.museumChanged.emit()
-
-    def museum_work(self, key):
-        if self.museum_view == "Saved":
-            return self.saved_works.get(key)
-        return next((work for work in self.works if work["key"] == key), None)
-
-    @Slot(str)
-    def saveMuseumWork(self, key):
-        work = self.museum_work(key)
-        if work:
-            try:
-                self.museum_library.toggle(work)
-                self.saved_works = self.museum_library.saved()
-            except sqlite3.Error as exc:
-                self.museum_message = str(exc)
-            self.museumChanged.emit()
-
-    def start_museum_task(self, operation, message):
-        self.last_museum_upload = None
-        self.museum_task = museum.MuseumTask(operation)
-        self.museum_task.setParent(self)
-        self.museum_task.finished.connect(self.finish_museum_task)
-        self.museum_message = message
-        self.museumChanged.emit()
-        self.changed.emit()
-        self.museum_task.start()
-
-    @Slot(str, "QVariantMap", bool)
-    def searchMuseum(self, query, form, more):
-        if self.task or self.museum_task:
-            return
-        if more:
-            if self.museum_view != "Results" or not self.more:
-                return
-        else:
-            try:
-                filters = museum.Filters.from_form(form)
-                if filters.source not in museum.SOURCES:
-                    raise ValueError("Choose a museum to search.")
-            except (TypeError, ValueError) as exc:
-                self.museum_message = str(exc)
-                self.museumChanged.emit()
-                return
-            self.museum_view = "Results"
-            self.search_query = query.strip()
-            self.museum_filters = filters
-            self.next_offset = 0
-            self.more = False
-            self.works = []
-        operation = partial(museum.search, self.search_query, self.next_offset,
-                            filters=self.museum_filters, library=self.museum_library)
-        self.start_museum_task(operation, f"Searching {museum.SOURCES[self.museum_filters.source]}…")
-
-    @Slot(str)
-    def importMuseum(self, key):
-        self.start_museum_import(key)
-
-    @Slot(str, QUrl)
-    def importMuseumFile(self, key, url):
-        if url.isLocalFile():
-            self.start_museum_import(key, Path(url.toLocalFile()))
-
-    def start_museum_import(self, key, local_file=None):
-        if self.task or self.museum_task:
-            return
-        work = self.museum_work(key)
-        if work:
-            self.discardMuseumPreview()
-
-            def download(cancelled):
-                try:
-                    return museum.preview_work(work, cancelled, local_file)
-                except (URLError, TimeoutError):
-                    if local_file or work["source"] != "chicago":
-                        raise
-                    return museum.LocalImageNeeded(key, work["link"], work["title"])
-
-            self.start_museum_task(download, "Preparing artwork preview…")
-
-    @Slot()
-    def discardMuseumPreview(self):
-        if self.museum_preview and not self.museum_task:
-            self.museum_preview.directory.cleanup()
-            self.museum_preview = None
-
-    def can_use_preview(self, zoom, x, y):
-        return (self.museum_preview is not None and not self.task and not self.museum_task
-                and 1 <= zoom <= 3 and 0 <= x <= 1 and 0 <= y <= 1)
-
-    @Slot(QUrl, float, float, float, result=bool)
-    def saveMuseumPreview(self, url, zoom, x, y):
-        if not self.can_use_preview(zoom, x, y) or not url.isLocalFile():
-            return False
-        target = Path(url.toLocalFile())
-        if target.suffix.lower() not in (".jpg", ".jpeg"):
-            self.museum_message = "Choose a JPEG filename ending in .jpg or .jpeg."
-            self.museumChanged.emit()
-            return False
-        preview = self.museum_preview
-
-        self.start_museum_task(partial(preview.save_copy, target, (zoom, x, y)), "Saving cropped copy…")
-        return True
-
-    @Slot(float, float, float, result=bool)
-    def sendMuseumPreview(self, zoom, x, y):
-        if not self.can_use_preview(zoom, x, y) or not self.paired or self.uncertain:
-            return False
-        preview = self.museum_preview
-
-        receipt = None
-
-        def confirmed(digest, cid, existing):
-            nonlocal receipt
-            receipt = (digest, cid, existing)
-
-        def sent(summary):
-            self.set_message(summary)
-            if receipt:
-                digest, cid, existing = receipt
-                self.last_museum_upload = (digest, cid, preview.title)
-                status = "Already on your Frame" if existing else "Added to your Frame"
-                self.museum_message = f"{status} · {preview.title}"
-            else:
-                self.museum_message = summary
-            self.museumChanged.emit()
-
-        def send(art, task):
-            crops = {str(preview.path): preview.crop((zoom, x, y))}
-            return sync_files(art, task.store, task.host, [preview.path], task.cancelled,
-                              task.progress.emit, resend=True, snapshot=task.snapshot,
-                              crop_overrides=crops, work_key=preview.key, confirmed=confirmed)
-
-        if not self.start_task(send, sent, "Preparing artwork for the Frame…", syncing=True):
-            self.museum_message = self.message
-            self.museumChanged.emit()
-            return False
-        self.museum_message = "Sending artwork to the Frame…"
-        self.museumChanged.emit()
-        self.task.museum_preview = preview
-        self.museum_preview = None
-        self.changed.emit()
-        return True
-
-    @Slot()
-    def showMuseumUpload(self):
-        if not self.last_museum_upload or not self.paired or self.task or self.museum_task:
-            return
-        digest, cid, title = self.last_museum_upload
-        host = self.host.strip()
-        if self.store.records(host).get(digest, (None, None))[1] != cid:
-            self.last_museum_upload = None
-            self.museum_message = "This crop is no longer on the Frame."
-            self.museumChanged.emit()
-            return
-        operation = partial(show_artwork, store=self.store, host=host, page=self.gallery.state["page"], cid=cid)
-
-        def displayed(snapshot):
-            self.gallery.apply_action(snapshot)
-            if cid not in snapshot.ids or snapshot.current == cid:
-                self.last_museum_upload = None
-            self.museum_message = snapshot.message or f"Now showing · {title}"
-            self.museumChanged.emit()
-
-        if self.run_tv_operation(operation, displayed, "Displaying artwork…"):
-            self.task.showing_museum_upload = True
-            self.museum_message = "Displaying artwork…"
-            self.museumChanged.emit()
-
-    @Slot()
-    def finish_museum_task(self):
-        task = self.sender() or self.museum_task
-        if task is not None:
-            task.deleteLater()
-        if self._shutting_down or task is not self.museum_task:
-            return
-        self.museum_task = None
-        self.museum_message = task.error
-        photo = None
-        if isinstance(task.result, museum.SearchPage):
-            seen = {work["key"] for work in self.works}
-            self.works.extend(work for work in task.result.works if work["key"] not in seen)
-            self.more = task.result.more
-            self.next_offset = task.result.next_offset
-            if not task.result.works and task.result.excluded_by_filters:
-                self.museum_message = "No images on this page match your filters."
-            elif not self.works:
-                self.museum_message = "No Open Access images on this page."
-        elif isinstance(task.result, museum.LocalImageNeeded):
-            self.museum_message = "Image download unavailable. You can import a copy from the museum record."
-            self.museumFileNeeded.emit(task.result.key, task.result.link, task.result.title)
-        elif isinstance(task.result, museum.MuseumPreview):
-            if task.isInterruptionRequested():
-                task.result.directory.cleanup()
-            else:
-                self.museum_preview = task.result
-                photo = self.photo_row(task.result.path, None)
-                photo["name"] = task.result.title
-        elif isinstance(task.result, Path):
-            self.museum_message = f"Saved cropped copy to {task.result.name}."
-            try:
-                if self.museum_preview:
-                    self.museum_library.remember_import(task.result, self.museum_preview.key)
-                if self.folder and task.result.parent.resolve() == self.folder.resolve():
-                    self.load_folder(self.folder)
-            except (OSError, ValueError, sqlite3.Error) as exc:
-                self.museum_message += f" Could not update the local library: {exc}"
-            self.museumPreviewSaved.emit()
-        self.museumChanged.emit()
-        self.changed.emit()
-        if photo:
-            self.museumPreviewReady.emit(photo)
-
     def read_journal(self):
         self.uncertain = [name for name, cid in self.store.records(self.host.strip()).values() if cid is None]
 
     @Slot(str, int)
     def setTarget(self, host, port):
-        if self.task or self.museum_task or (host, port) == (self.host, self.port):
+        if self.task or self._museum.museum_task or (host, port) == (self.host, self.port):
             return
-        self.last_museum_upload = None
-        self.museum_message = ""
         self.cancel_reconnect()
         self.host, self.port = host, port
         self.known_target = self.last_connection == {"host": host.strip(), "port": port}
         self.paired = False
         self.gallery.reset()
         self._frame_settings.reset()
-        self.updateMuseumOnFrame(set())
+        self._museum.reset_target()
         self.message = "Connect your TV to start syncing."
         self.read_journal()
         self.changed.emit()
@@ -470,6 +206,8 @@ class Controller(QObject):
         if path != self.folder:
             self.extra_paths.clear()
             self.selected.clear()
+        else:
+            self.extra_paths = [photo for photo in self.extra_paths if photo.is_file()]
         self.folder, self.folder_paths = path, paths
         self.reload_photos()
 
@@ -483,7 +221,7 @@ class Controller(QObject):
 
     @Slot("QVariantList")
     def addPhotos(self, urls):
-        if self.task or self.museum_task:
+        if self.task or self._museum.museum_task:
             return
         added = []
         for value in urls:
@@ -503,9 +241,36 @@ class Controller(QObject):
             message += " Only JPG and PNG files were added."
         self.set_message(message)
 
+    @Slot()
+    def refreshFolder(self):
+        if self.task or self._museum.museum_task or self.folder is None:
+            return
+        try:
+            self.load_folder(self.folder)
+        except (OSError, ValueError) as exc:
+            self.set_message(str(exc))
+            return
+        self.set_message("Folder refreshed.")
+
+    @Slot()
+    def clearAddedPhotos(self):
+        if self.task or self._museum.museum_task or not self.extra_paths:
+            return
+        self.extra_paths.clear()
+        self.reload_photos()
+        self.set_message("Manually added photos cleared from the list.")
+
+    @Slot()
+    def clearSelection(self):
+        if self.task or self._museum.museum_task or not self.selected:
+            return
+        self.selected.clear()
+        self.selectionChanged.emit()
+        self.set_message("Selection cleared.")
+
     @Slot(int, bool)
     def selectPhoto(self, index, selected):
-        if self.task or self.museum_task or not 0 <= index < len(self.paths):
+        if self.task or self._museum.museum_task or not 0 <= index < len(self.paths):
             return
         path = self.paths[index]
         if selected:
@@ -534,7 +299,7 @@ class Controller(QObject):
 
     @Slot(int, float, float, float, bool, result=bool)
     def applyCrop(self, index, zoom, x, y, reset):
-        if self.task or self.museum_task or not 0 <= index < len(self.paths):
+        if self.task or self._museum.museum_task or not 0 <= index < len(self.paths):
             return False
         if not (1 <= zoom <= 3 and 0 <= x <= 1 and 0 <= y <= 1):
             return False
@@ -557,7 +322,7 @@ class Controller(QObject):
 
     @Slot(QUrl)
     def chooseFolder(self, url):
-        if self.museum_task or self.task or not url.isLocalFile():
+        if self._museum.museum_task or self.task or not url.isLocalFile():
             return
         try:
             self.load_folder(Path(url.toLocalFile()))
@@ -605,7 +370,7 @@ class Controller(QObject):
         if task.error:
             self.set_message("Couldn’t reconnect to the Frame. Retry when the TV is ready.")
         else:
-            self.updateMuseumOnFrame(task.content_snapshot)
+            self._museum.update_on_frame(task.content_snapshot)
             self.connected(task.output)
 
     @Slot(bool)
@@ -613,11 +378,11 @@ class Controller(QObject):
         if sync:
             if self.state["ready"]:
                 self.start_send()
-        elif not self.task and not self.museum_task and not self.reconnect_task:
+        elif not self.task and not self._museum.museum_task and not self.reconnect_task:
             self.paired = False
             self.gallery.reset()
             self._frame_settings.reset()
-            self.updateMuseumOnFrame(set())
+            self._museum.update_on_frame(set())
             self.start_task(read_library, self.connected, "Connecting to your TV…", read_only=True)
 
     def connected(self, count):
@@ -651,14 +416,14 @@ class Controller(QObject):
 
         self.start_task(send, self.set_message, "Preparing to send photos…", syncing=True)
 
-    def run_tv_operation(self, operation, finished, message):
+    def run_tv_operation(self, operation, finished, message, *, failed=None):
         if not self.paired:
             self.set_message("Connect to your Frame first.")
             return False
-        return self.start_task(lambda art, _: operation(art), finished, message)
+        return self.start_task(lambda art, _: operation(art), finished, message, failed=failed)
 
-    def start_task(self, operation, completed, message, syncing=False, gallery_loading=False, *, read_only=False):
-        if self.task or (self.museum_task and not gallery_loading) or (gallery_loading and self.gallery_task):
+    def start_task(self, operation, completed, message, syncing=False, gallery_loading=False, *, read_only=False, failed=None):
+        if self.task or (self._museum.museum_task and not gallery_loading) or (gallery_loading and self.gallery_task):
             return False
         try:
             host = validate_host(self.host)
@@ -678,7 +443,7 @@ class Controller(QObject):
             return True
         resume_gallery = self.gallery_task is not None
         self.cancel_gallery()
-        self.task = Task(self.store, host, self.port, operation, completed, syncing, self.tv_lock, read_only=read_only)
+        self.task = Task(self.store, host, self.port, operation, completed, syncing, self.tv_lock, read_only=read_only, failed=failed)
         self.task.setParent(self)
         self.task.resume_gallery = resume_gallery
         self.task.progress.connect(self.progress)
@@ -713,18 +478,11 @@ class Controller(QObject):
         self.cancel_gallery()
         if self.task:
             self.task.cancel()
-        if self.museum_task:
-            self.museum_task.requestInterruption()
+        self._museum.begin_shutdown()
         for thread in self.findChildren(QThread):
             thread.wait()
-        if self.museum_preview:
-            self.museum_preview.directory.cleanup()
-            self.museum_preview = None
-        if self.task and self.task.museum_preview:
-            self.task.museum_preview.directory.cleanup()
-            self.task.museum_preview = None
+        self._museum.cleanup()
         self.task = None
-        self.museum_task = None
 
     @Slot(int, int, str)
     def progress(self, done, total, message):
@@ -744,22 +502,17 @@ class Controller(QObject):
         if self._shutting_down or task is not self.task:
             return
         self.task = None
-        if task.museum_preview:
-            task.museum_preview.directory.cleanup()
         if task.syncing:
             self.gallery.reset()
         self.read_journal()
         cancelled_read = task.read_cancellation is not None and task.cancelled.is_set()
         if task.content_snapshot is not None and not cancelled_read:
-            self.updateMuseumOnFrame(task.content_snapshot)
+            self._museum.update_on_frame(task.content_snapshot)
         if cancelled_read:
             self.set_message("TV operation cancelled.")
         elif task.error:
-            if task.museum_preview or task.showing_museum_upload:
-                self.museum_message = task.error
-                if task.museum_preview and self.uncertain:
-                    self.museum_message += " Open Local photos to resolve the interrupted upload."
-                self.museumChanged.emit()
+            if task.failed:
+                task.failed(task.error)
             self.set_message(task.error)
         else:
             self.message = ""
@@ -784,10 +537,7 @@ class Controller(QObject):
 
     @Slot()
     def stop(self):
-        if self.museum_task:
-            self.museum_task.requestInterruption()
-            self.museum_message = "Cancelling museum request…"
-            self.museumChanged.emit()
+        self._museum.cancel()
         if self.task:
             if self.task.read_cancellation is not None:
                 self.cancelConnection()

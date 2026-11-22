@@ -22,13 +22,11 @@ ApplicationWindow {
     Binding { target: FrameTheme; property: "dark"; value: win.dark }
     color: FrameTheme.canvas
     palette: FramePalette {}
-    FontLoader { id: bodyFont; source: "fonts/atkinson.woff2" }
-    FontLoader { id: headingFont; source: "fonts/asul.woff2" }
-    font.family: bodyFont.name
+    font.family: FrameTheme.bodyFont
     font.pixelSize: 15
 
     component Title: Label {
-        font.family: headingFont.name
+        font.family: FrameTheme.headingFont
         color: FrameTheme.ink
     }
     onClosing: close => {
@@ -43,7 +41,7 @@ ApplicationWindow {
         backend: win.backend
     }
     Connections {
-        target: win.backend
+        target: win.backend.museum
         function onMuseumPreviewReady(photo) {
             cropEditor.edit(-1, photo)
         }
@@ -291,7 +289,6 @@ ApplicationWindow {
             Layout.margins: 26
             visible: win.page === "discover"
             backend: win.backend
-            headingFamily: headingFont.name
         }
         ColumnLayout {
             visible: win.page === "library"
@@ -305,6 +302,37 @@ ApplicationWindow {
                 Title { text: "Your photos"; font.pixelSize: 38; Layout.fillWidth: true }
                 FrameButton { objectName: "addPhotos"; text: "Add photos…"; enabled: !win.session.busy; onClicked: files.open() }
                 FrameButton { text: "Choose folder…"; enabled: !win.session.busy; onClicked: chooser.open() }
+                FrameButton {
+                    id: managePhotos
+                    objectName: "managePhotos"
+                    text: "Manage"
+                    enabled: !win.session.busy && (win.session.folder || win.session.addedCount || win.session.selectedCount)
+                    onClicked: photoActions.open()
+                    Menu {
+                        id: photoActions
+                        x: managePhotos.width - width
+                        y: managePhotos.height
+                        palette: FramePalette {}
+                        MenuItem {
+                            objectName: "refreshFolder"
+                            text: "Refresh folder"
+                            enabled: !win.session.busy && !!win.session.folder
+                            onTriggered: win.backend.refreshFolder()
+                        }
+                        MenuItem {
+                            objectName: "clearAddedPhotos"
+                            text: "Clear added photos"
+                            enabled: !win.session.busy && win.session.addedCount > 0
+                            onTriggered: win.backend.clearAddedPhotos()
+                        }
+                        MenuItem {
+                            objectName: "clearSelection"
+                            text: "Clear selection"
+                            enabled: !win.session.busy && win.session.selectedCount > 0
+                            onTriggered: win.backend.clearSelection()
+                        }
+                    }
+                }
             }
             Label {
                 Layout.fillWidth: true

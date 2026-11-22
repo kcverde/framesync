@@ -6,15 +6,15 @@ import QtQuick.Dialogs as Dialogs
 ColumnLayout {
     id: page
     required property var backend
-    required property string headingFamily
-    readonly property var collection: backend ? backend.collection : ({works: [], query: "", message: "", more: false, busy: false})
+    readonly property var museumController: backend ? backend.museum : null
+    readonly property var collection: museumController ? museumController.state : ({works: [], query: "", message: "", more: false, busy: false})
     readonly property var session: backend ? backend.state : ({busy: false})
     spacing: 12
 
     readonly property string sourceId: ["met", "cleveland", "chicago"][source.currentIndex] || "met"
 
     function runSearch() {
-        page.backend.searchMuseum(query.text, {
+        page.museumController.searchMuseum(query.text, {
             source: page.sourceId,
             field: field.currentText, artist: artist.text.trim(), medium: medium.text.trim(),
             region: region.text.trim(), department: department.text.trim(),
@@ -23,7 +23,7 @@ ColumnLayout {
     }
 
     Connections {
-        target: page.backend
+        target: page.museumController
         function onMuseumFileNeeded(key, link, title) {
             localImport.workKey = key
             localImport.recordLink = link
@@ -59,7 +59,7 @@ ColumnLayout {
         nameFilters: ["Images (*.jpg *.jpeg *.png *.tif *.tiff *.JPG *.JPEG *.PNG *.TIF *.TIFF)"]
         onAccepted: {
             localImport.close()
-            page.backend.importMuseumFile(localImport.workKey, selectedFile)
+            page.museumController.importMuseumFile(localImport.workKey, selectedFile)
         }
     }
 
@@ -113,7 +113,7 @@ ColumnLayout {
 
     RowLayout {
         Layout.fillWidth: true
-        Label { text: "Discover"; font.family: page.headingFamily; font.pixelSize: 38; Layout.fillWidth: true }
+        Label { text: "Discover"; font.family: FrameTheme.headingFont; font.pixelSize: 38; Layout.fillWidth: true }
         Button {
             objectName: "myframeFitCard"
             text: "Make art for your Frame"
@@ -152,7 +152,7 @@ ColumnLayout {
             onActivated: {
                 field.currentIndex = 0
                 if (query.text.trim() || page.collection.view === "Results") page.runSearch()
-                else page.backend.museumView("Featured", page.sourceId)
+                else page.museumController.museumView("Featured", page.sourceId)
             }
         }
         FrameTextField {
@@ -167,8 +167,8 @@ ColumnLayout {
         FrameButton { text: "Search"; enabled: !page.session.busy; onClicked: page.runSearch() }
     }
     RowLayout {
-        FrameButton { text: "All featured"; enabled: !page.session.busy; onClicked: { query.clear(); page.backend.museumView("Featured") } }
-        FrameButton { text: "Saved"; enabled: !page.session.busy; onClicked: page.backend.museumView("Saved") }
+        FrameButton { text: "All featured"; enabled: !page.session.busy; onClicked: { query.clear(); page.museumController.museumView("Featured") } }
+        FrameButton { text: "Saved"; enabled: !page.session.busy; onClicked: page.museumController.museumView("Saved") }
         Item { Layout.fillWidth: true }
         FrameButton { text: "Filters…"; enabled: !page.session.busy; onClicked: filters.open() }
     }
@@ -276,7 +276,7 @@ ColumnLayout {
                             quiet: true
                             text: modelData.saved ? "♥ Saved" : "♡ Save"
                             Accessible.name: modelData.saved ? "Remove from saved" : "Save for later"
-                            onClicked: page.backend.saveMuseumWork(modelData.key)
+                            onClicked: page.museumController.saveMuseumWork(modelData.key)
                         }
                     }
                     RowLayout {
@@ -285,7 +285,7 @@ ColumnLayout {
                             primary: true
                             text: "Preview & crop…"
                             enabled: !page.session.busy
-                            onClicked: page.backend.importMuseum(modelData.key)
+                            onClicked: page.museumController.importMuseum(modelData.key)
                             Accessible.name: "Preview and crop " + modelData.title
                         }
                         Label { visible: modelData.onFrame; text: "On Frame"; font.pixelSize: 12; color: FrameTheme.green }
@@ -298,10 +298,10 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: false
         visible: page.collection.busy || page.collection.more || page.collection.message.length > 0 ||
-                 !!page.session.museumSending || !!page.collection.canShowUpload
+                 !!page.collection.sending || !!page.collection.canShowUpload
         Label {
             Layout.fillWidth: true
-            text: page.session.museumSending ? page.session.message : page.collection.message
+            text: page.collection.sending ? page.session.message : page.collection.message
             visible: text.length > 0
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
@@ -311,14 +311,14 @@ ColumnLayout {
             visible: !!page.collection.canShowUpload
             enabled: !!page.session.paired && !page.session.busy
             text: "Show on Frame"
-            onClicked: page.backend.showMuseumUpload()
+            onClicked: page.museumController.showMuseumUpload()
         }
-        FrameButton { visible: !!page.session.museumSending; text: "Stop"; onClicked: page.backend.stop() }
+        FrameButton { visible: !!page.collection.sending; text: "Stop"; onClicked: page.backend.stop() }
         FrameButton { visible: page.collection.busy; text: "Cancel"; onClicked: page.backend.stop() }
         FrameButton {
             visible: page.collection.more && !page.collection.busy
             text: "More results"
-            onClicked: page.backend.searchMuseum("", {}, true)
+            onClicked: page.museumController.searchMuseum("", {}, true)
         }
     }
 }

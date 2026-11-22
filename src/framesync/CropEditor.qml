@@ -7,6 +7,7 @@ import QtCore
 FrameDialog {
     id: editor
     required property var backend
+    readonly property var museumController: backend ? backend.museum : null
     property var photo: ({w: 1, h: 1, url: "", name: "", cropped: false})
     property int photoIndex: -1
     property bool museumPreview: false
@@ -32,13 +33,13 @@ FrameDialog {
     title: museumPreview ? "Preview & crop" : "Crop to 4K"
     onClosed: {
         if (museumPreview) {
-            backend.discardMuseumPreview()
+            museumController.discardMuseumPreview()
             museumPreview = false
         }
         photo = {w: 1, h: 1, url: "", name: "", cropped: false}
     }
     Connections {
-        target: editor.backend
+        target: editor.museumController
         function onMuseumPreviewSaved() { editor.savedCopy = true }
     }
     FrameDialog {
@@ -127,7 +128,7 @@ FrameDialog {
         fileMode: Dialogs.FileDialog.SaveFile
         nameFilters: ["JPEG image (*.jpg *.jpeg)"]
         defaultSuffix: "jpg"
-        onAccepted: editor.backend.saveMuseumPreview(selectedFile, zoom.value, horizontal.value, vertical.value)
+        onAccepted: editor.museumController.saveMuseumPreview(selectedFile, zoom.value, horizontal.value, vertical.value)
     }
     contentItem: ColumnLayout {
         spacing: 8
@@ -176,7 +177,7 @@ FrameDialog {
         Label {
             Layout.fillWidth: true
             visible: editor.museumPreview && text.length > 0
-            text: editor.museumPreview && editor.backend ? (editor.backend.collection.message || editor.connectionHint) : ""
+            text: editor.museumPreview && editor.backend ? (editor.museumController.state.message || editor.connectionHint) : ""
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
         }
@@ -229,7 +230,7 @@ FrameDialog {
                         connectDialog.configure()
                         return
                     }
-                    if (editor.backend.sendMuseumPreview(zoom.value, horizontal.value, vertical.value)) {
+                    if (editor.museumController.sendMuseumPreview(zoom.value, horizontal.value, vertical.value)) {
                         editor.museumPreview = false
                         editor.close()
                     }

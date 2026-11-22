@@ -216,7 +216,7 @@ class Gallery(QObject):
 
     def _apply(self, snapshot):
         self.snapshot = snapshot
-        self.backend.updateMuseumOnFrame(snapshot.ids)
+        self.backend.museum.update_on_frame(snapshot.ids)
         self.changed.emit()
 
     def apply_action(self, snapshot):

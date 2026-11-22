@@ -27,9 +27,9 @@ class MuseumPreviewTests(unittest.TestCase):
         self.store = Store(self.root / "state")
         self.controller = Controller(self.store)
         self.addCleanup(self.controller.shutdown)
-        self.work = next(work for work in self.controller.works if work["source"] == "cleveland")
+        self.work = next(work for work in self.controller.museum.works if work["source"] == "cleveland")
         self.previews = []
-        self.controller.museumPreviewReady.connect(self.previews.append)
+        self.controller.museum.museumPreviewReady.connect(self.previews.append)
         source = Image.new("RGB", (320, 90), "red")
         source.paste("blue", (160, 0, 320, 90))
         jpeg = io.BytesIO()
@@ -38,16 +38,16 @@ class MuseumPreviewTests(unittest.TestCase):
 
     def wait_for_workers(self):
         deadline = time.monotonic() + 5
-        while self.controller.task or self.controller.museum_task or self.controller.gallery_task:
+        while self.controller.task or self.controller.museum.museum_task or self.controller.gallery_task:
             self.assertLess(time.monotonic(), deadline, "FrameSync worker timed out")
             self.app.processEvents()
             time.sleep(.005)
 
     def open_preview(self):
         previous_count = len(self.previews)
-        self.controller.importMuseum(self.work["key"])
+        self.controller.museum.importMuseum(self.work["key"])
         self.wait_for_workers()
-        self.assertEqual(len(self.previews), previous_count + 1, self.controller.museum_message)
+        self.assertEqual(len(self.previews), previous_count + 1, self.controller.museum.museum_message)
         item = self.previews[-1]
         self.assertEqual((item["w"], item["h"]), (320, 90))
         path = Path(QUrl(item["url"]).toLocalFile())
@@ -124,7 +124,7 @@ class MuseumPreviewTests(unittest.TestCase):
     def test_cancel_discards_preview_and_leaves_chosen_folder_untouched(self):
         path = self.open_preview()
         self.assertIsNone(self.controller.folder)
-        self.controller.discardMuseumPreview()
+        self.controller.museum.discardMuseumPreview()
         self.assertFalse(path.exists())
 
         folder = self.root / "photos"
@@ -134,7 +134,7 @@ class MuseumPreviewTests(unittest.TestCase):
         original = existing.read_bytes()
         self.controller.chooseFolder(QUrl.fromLocalFile(str(folder)))
         path = self.open_preview()
-        self.controller.discardMuseumPreview()
+        self.controller.museum.discardMuseumPreview()
         self.assertFalse(path.exists())
         self.assertEqual(list(folder.iterdir()), [existing])
         self.assertEqual(existing.read_bytes(), original)
@@ -142,21 +142,21 @@ class MuseumPreviewTests(unittest.TestCase):
     def test_export_saves_chosen_crop_without_a_folder_or_tv(self):
         path = self.open_preview()
         saved = []
-        self.controller.museumPreviewSaved.connect(lambda: saved.append(True))
+        self.controller.museum.museumPreviewSaved.connect(lambda: saved.append(True))
         # A save failure leaves the source available to try another destination.
         invalid = self.root / "absent" / "framing.jpg"
-        self.controller.saveMuseumPreview(QUrl.fromLocalFile(str(invalid)), 2, 1, .5)
+        self.controller.museum.saveMuseumPreview(QUrl.fromLocalFile(str(invalid)), 2, 1, .5)
         self.wait_for_workers()
         self.assertFalse(saved)
         self.assertFalse(invalid.exists())
         self.assertTrue(path.exists())
         target = self.root / "my-framing.jpg"
-        self.assertTrue(self.controller.saveMuseumPreview(QUrl.fromLocalFile(str(target)), 2, 1, .5))
+        self.assertTrue(self.controller.museum.saveMuseumPreview(QUrl.fromLocalFile(str(target)), 2, 1, .5))
         self.wait_for_workers()
         self.assertEqual(saved, [True])
         self.assert_blue_4k_crop(target)
         self.assertTrue(path.exists())
-        self.controller.discardMuseumPreview()
+        self.controller.museum.discardMuseumPreview()
         self.assertFalse(path.exists())
         self.assertFalse(self.controller.photos)
         self.assertIsNone(self.controller.folder)
@@ -165,7 +165,7 @@ class MuseumPreviewTests(unittest.TestCase):
         tv = self.fake_tv()
         for _ in range(2):
             path = self.open_preview()
-            self.assertTrue(self.controller.sendMuseumPreview(2, 1, .5))
+            self.assertTrue(self.controller.museum.sendMuseumPreview(2, 1, .5))
             self.wait_for_workers()
             self.assertFalse(path.exists())
         tv.upload.assert_called_once()
@@ -174,7 +174,7 @@ class MuseumPreviewTests(unittest.TestCase):
         digest = hashlib.sha256(payload).hexdigest()
         _, cid = self.store.records(self.controller.host)[digest]
         self.assertEqual(cid, "MY_F1")
-        self.assertEqual(self.controller.museum_library.keys_on_tv(self.controller.host, {cid}), {self.work["key"]})
+        self.assertEqual(self.controller.museum.museum_library.keys_on_tv(self.controller.host, {cid}), {self.work["key"]})
         self.assertFalse(self.controller.photos)
         self.assertIsNone(self.controller.folder)
 
@@ -204,11 +204,11 @@ class MuseumPreviewTests(unittest.TestCase):
             self.assertEqual(window.property("page"), "discover")
             self.assertEqual(tv.select_image.call_count, before)
             self.assertTrue(show.property("visible"))
-            self.assertIn("Already on" if existing else "Added to", self.controller.museum_message)
+            self.assertIn("Already on" if existing else "Added to", self.controller.museum.museum_message)
             show.click()
             self.wait_for_workers()
             tv.select_image.assert_called_with(expected, category=None, show=True)
-            self.assertIn("Now showing", self.controller.museum_message)
+            self.assertIn("Now showing", self.controller.museum.museum_message)
             self.assertFalse(show.property("visible"))
         self.assertEqual(tv.upload.call_count, 2)
         window.close()
@@ -216,33 +216,33 @@ class MuseumPreviewTests(unittest.TestCase):
     def test_show_after_removal_clears_action_without_selecting_another_work(self):
         tv = self.fake_tv()
         self.open_preview()
-        self.assertTrue(self.controller.sendMuseumPreview(2, 1, .5))
+        self.assertTrue(self.controller.museum.sendMuseumPreview(2, 1, .5))
         self.wait_for_workers()
         tv.available.side_effect = lambda: [dict(content_id="another-photo")]
-        self.controller.showMuseumUpload()
+        self.controller.museum.showMuseumUpload()
         self.wait_for_workers()
         tv.select_image.assert_not_called()
-        self.assertFalse(self.controller.collection["canShowUpload"])
-        self.assertIn("no longer", self.controller.museum_message)
+        self.assertFalse(self.controller.museum.state["canShowUpload"])
+        self.assertIn("no longer", self.controller.museum.museum_message)
 
     def test_lost_upload_confirmation_blocks_resend_until_explicit_resolution(self):
         tv = self.fake_tv()
         accept_upload = tv.upload.side_effect
         tv.upload.side_effect = TimeoutError("lost confirmation")
         self.open_preview()
-        self.assertTrue(self.controller.sendMuseumPreview(2, 1, .5))
+        self.assertTrue(self.controller.museum.sendMuseumPreview(2, 1, .5))
         self.wait_for_workers()
         self.assertTrue(self.controller.uncertain)
-        self.assertFalse(self.controller.collection["canShowUpload"])
-        self.assertIn("Could not confirm", self.controller.museum_message)
+        self.assertFalse(self.controller.museum.state["canShowUpload"])
+        self.assertIn("Could not confirm", self.controller.museum.museum_message)
         self.assertIn(None, [cid for _, cid in self.store.records(self.controller.host).values()])
         staged = self.open_preview()
-        self.assertFalse(self.controller.sendMuseumPreview(2, 1, .5))
+        self.assertFalse(self.controller.museum.sendMuseumPreview(2, 1, .5))
         self.assertTrue(staged.exists())
         tv.upload.assert_called_once()
         self.controller.resolve()
         tv.upload.side_effect = accept_upload
-        self.assertTrue(self.controller.sendMuseumPreview(2, 1, .5))
+        self.assertTrue(self.controller.museum.sendMuseumPreview(2, 1, .5))
         self.wait_for_workers()
         self.assertFalse(staged.exists())
         self.assertFalse(self.controller.uncertain)
