@@ -195,14 +195,14 @@ class FrameArt(SamsungTVArt):
         with self._d2d_lock:
             sockets = list(self._d2d_sockets)
         for sock in sockets:
-            try:
-                sock.shutdown(2)
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
+            _shutdown_socket(sock)
+            # The read worker closes its socket after waking. Closing it here can
+            # race with the worker's timed recv entering select on macOS.
+            if self.read_cancellation is None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     @contextmanager
     def _deadline(self, connection, seconds):
