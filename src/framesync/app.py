@@ -412,7 +412,9 @@ class Controller(QObject):
             self.works.extend(work for work in task.result.works if work["key"] not in seen)
             self.more = task.result.more
             self.next_offset = task.result.next_offset
-            if not self.works:
+            if not task.result.works and task.result.excluded_by_filters:
+                self.museum_message = "No images on this page match your filters."
+            elif not self.works:
                 self.museum_message = "No Open Access images on this page."
         elif isinstance(task.result, museum.LocalImageNeeded):
             self.museum_message = "Image download unavailable. You can import a copy from the museum record."

@@ -1,14 +1,19 @@
 """Paginated public-domain image searches against the museums' collection APIs."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 import json
 import socket
+import ssl
 import threading
 from time import monotonic
 from urllib.error import HTTPError
-from urllib.parse import quote, unquote, urlencode, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener, getproxies, proxy_bypass
+
+import urllib3
+from urllib3.connection import HTTPConnection, HTTPSConnection
 
 
 try:
@@ -23,6 +28,8 @@ JSON_DEADLINE_SECONDS = 15.0
 _REQUEST_LOCK = threading.Lock()
 _ACTIVE_RESPONSES: dict[int, set] = {}
 _CANCELLED_THREADS: set[int] = set()
+_REQUEST_CONTEXT = threading.local()
+MET_SEARCH_WORKERS = 4
 
 
 class _HttpsOnlyRedirectHandler(HTTPRedirectHandler):
@@ -36,7 +43,140 @@ class _HttpsOnlyRedirectHandler(HTTPRedirectHandler):
 _OPENER = build_opener(_HttpsOnlyRedirectHandler)
 
 
-def urlopen(request, timeout=None):
+def _request_owner():
+    return getattr(_REQUEST_CONTEXT, "owner", threading.get_ident())
+
+
+class _PendingHeaders:
+    def __init__(self, sock):
+        self.sock = sock
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+class _CancellableHeaders:
+    @contextmanager
+    def _reading_headers(self):
+        with tracked_response(_PendingHeaders(self.sock), deadline=_REQUEST_CONTEXT.deadline) as expired:
+            try:
+                yield
+            except Exception as exc:
+                if is_thread_cancelled():
+                    raise InterruptedError("Museum request cancelled.") from exc
+                if expired.is_set():
+                    raise TimeoutError("Timed out reading museum response headers.") from exc
+                raise
+            if is_thread_cancelled():
+                raise InterruptedError("Museum request cancelled.")
+            if expired.is_set():
+                raise TimeoutError("Timed out reading museum response headers.")
+
+    def getresponse(self):
+        with self._reading_headers():
+            return super().getresponse()
+
+    def _tunnel(self):
+        with self._reading_headers():
+            return super()._tunnel()
+
+
+class _MuseumHTTPConnection(_CancellableHeaders, HTTPConnection):
+    pass
+
+
+class _MuseumHTTPSConnection(_CancellableHeaders, HTTPSConnection):
+    pass
+
+
+class _MuseumHTTPPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _MuseumHTTPConnection
+
+
+class _MuseumHTTPSPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _MuseumHTTPSConnection
+
+
+def _new_pool(proxy):
+    options = dict(maxsize=1, ssl_context=ssl.create_default_context())
+    if proxy:
+        parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+        # Proxy credentials are sent only to the proxy, never to the museum host.
+        headers = urllib3.make_headers(proxy_basic_auth=f"{unquote(parsed.username or '')}:{unquote(parsed.password or '')}") if parsed.username else None
+        manager = urllib3.ProxyManager(f"{parsed.scheme}://{parsed.netloc.rsplit('@', 1)[-1]}",
+                                       proxy_headers=headers, **options)
+    else:
+        manager = urllib3.PoolManager(**options)
+    manager.pool_classes_by_scheme = {"http": _MuseumHTTPPool, "https": _MuseumHTTPSPool}
+    return manager
+
+
+@contextmanager
+def _pooled_requests(owner):
+    # Keep each worker's sockets private until its response has been unregistered.
+    pools = {}
+    _REQUEST_CONTEXT.owner = owner
+    _REQUEST_CONTEXT.pools = pools
+    try:
+        yield
+    finally:
+        del _REQUEST_CONTEXT.owner
+        del _REQUEST_CONTEXT.pools
+        for pool in pools.values():
+            pool.clear()
+
+
+@contextmanager
+def _pooled_open(pools, request, timeout, deadline):
+    url = request.full_url
+    for _ in range(11):
+        if is_thread_cancelled():
+            raise InterruptedError("Museum request cancelled.")
+        validated = museum_request(url)
+        proxy = None if proxy_bypass(validated.host) else getproxies().get("https")
+        if proxy not in pools:
+            pools[proxy] = _new_pool(proxy)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out opening museum response.")
+        _REQUEST_CONTEXT.deadline = deadline
+        try:
+            response = pools[proxy].request(
+                "GET", url, headers=dict(request.header_items()),
+                timeout=urllib3.Timeout(total=remaining, connect=timeout, read=timeout),
+                preload_content=False, redirect=False, retries=False,
+            )
+        except Exception as exc:
+            if is_thread_cancelled():
+                raise InterruptedError("Museum request cancelled.") from exc
+            if monotonic() >= deadline:
+                raise TimeoutError("Timed out opening museum response.") from exc
+            raise
+        finally:
+            del _REQUEST_CONTEXT.deadline
+        try:
+            location = response.get_redirect_location()
+            if location:
+                url = urljoin(url, location)
+                continue
+            if not 200 <= response.status < 300:
+                raise HTTPError(url, response.status, response.reason, response.headers, None)
+            yield response
+            return
+        finally:
+            # Do not drain large partial image responses just to recycle a connection.
+            response.close()
+            response.release_conn()
+    raise ValueError("Too many museum redirects.")
+
+
+def urlopen(request, timeout=None, *, deadline=None):
+    pools = getattr(_REQUEST_CONTEXT, "pools", None)
+    if pools is not None:
+        return _pooled_open(pools, request, timeout, deadline)
     return _OPENER.open(request, timeout=timeout)
 
 
@@ -47,6 +187,12 @@ def _response_socket(response):
 
 
 def _abort_response(response):
+    if isinstance(response, urllib3.HTTPResponse):
+        try:
+            response.shutdown()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return
     sock = _response_socket(response)
     if sock is not None:
         try:
@@ -71,9 +217,8 @@ def abort_thread_requests(thread_id: int | None):
         return
     with _REQUEST_LOCK:
         _CANCELLED_THREADS.add(thread_id)
-        responses = list(_ACTIVE_RESPONSES.get(thread_id, ()))
-    for response in responses:
-        _abort_response(response)
+        for response in _ACTIVE_RESPONSES.get(thread_id, ()):
+            _abort_response(response)
 
 
 def clear_thread_cancellation(thread_id: int):
@@ -82,14 +227,14 @@ def clear_thread_cancellation(thread_id: int):
 
 
 def is_thread_cancelled(thread_id: int | None = None) -> bool:
-    ident = threading.get_ident() if thread_id is None else thread_id
+    ident = _request_owner() if thread_id is None else thread_id
     with _REQUEST_LOCK:
         return ident in _CANCELLED_THREADS
 
 
 @contextmanager
 def tracked_response(response, *, deadline: float | None = None):
-    ident = threading.get_ident()
+    ident = _request_owner()
     expired = threading.Event()
     with _REQUEST_LOCK:
         if ident in _CANCELLED_THREADS:
@@ -143,6 +288,7 @@ class SearchPage:
     works: list
     next_offset: int
     more: bool
+    excluded_by_filters: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,7 +330,7 @@ def museum_request(url):
 
 def fetch_json(url):
     deadline = monotonic() + JSON_DEADLINE_SECONDS
-    with urlopen(museum_request(url), timeout=12) as response, tracked_response(response, deadline=deadline) as expired:
+    with urlopen(museum_request(url), timeout=12, deadline=deadline) as response, tracked_response(response, deadline=deadline) as expired:
         chunks = []
         received = 0
         try:
@@ -231,7 +377,7 @@ def met_artwork(data):
                   data.get("imageWidth"), data.get("imageHeight"))
 
 
-def met_search(query, offset, filters, cancelled, fetch):
+def met_search(query, offset, filters, cancelled, fetch, dimensions=None):
     limit = min(PAGE_SIZE, 10000 - offset)
     term = query or filters.artist or filters.medium or filters.department or filters.region or "*"
     params = dict(q=term, hasImages="true", offset=offset, limit=limit)
@@ -248,27 +394,50 @@ def met_search(query, offset, filters, cancelled, fetch):
     if filters.start is not None or filters.end is not None:
         params.update(dateBegin=filters.start if filters.start is not None else -100000,
                       dateEnd=filters.end if filters.end is not None else 9999)
-    page = fetch(f"{MET}/v1.1/search?{urlencode(params)}")
-    ids = page.get("objectIDs") or []
-    works = []
-    for object_id in ids:
+    owner = _request_owner()
+    with _pooled_requests(owner):
         if cancelled():
             raise InterruptedError("Museum search cancelled.")
-        try:
-            data = fetch(f"{MET}/v1/objects/{int(object_id)}")
-        except HTTPError as exc:
-            if exc.code == 404:
-                continue
-            raise
-        if filters.department.casefold() not in (data.get("department") or "").casefold():
-            continue
-        if filters.artist.casefold() not in (data.get("artistDisplayName") or "").casefold():
-            continue
-        work = met_artwork(data)
-        if work:
-            works.append(work)
+        page = fetch(f"{MET}/v1.1/search?{urlencode(params)}")
+    ids = page.get("objectIDs") or []
+    department, artist = filters.department.casefold(), filters.artist.casefold()
+
+    def fetch_objects(batch):
+        works = []
+        excluded_by_filters = False
+        with _pooled_requests(owner):
+            for object_id in batch:
+                if cancelled():
+                    raise InterruptedError("Museum search cancelled.")
+                try:
+                    data = fetch(f"{MET}/v1/objects/{int(object_id)}")
+                except HTTPError as exc:
+                    if exc.code == 404:
+                        continue
+                    raise
+                work = met_artwork(data)
+                if not work:
+                    continue
+                if (department not in (data.get("department") or "").casefold()
+                        or artist not in (data.get("artistDisplayName") or "").casefold()):
+                    excluded_by_filters = True
+                    continue
+                if dimensions and not (work["width"] and work["height"]):
+                    work["width"], work["height"] = dimensions(work["original"], cancelled)
+                works.append(work)
+        return works, excluded_by_filters
+
+    works = []
+    excluded_by_filters = False
+    if ids:
+        batch_size = (len(ids) + MET_SEARCH_WORKERS - 1) // MET_SEARCH_WORKERS
+        batches = [ids[start:start + batch_size] for start in range(0, len(ids), batch_size)]
+        with ThreadPoolExecutor(max_workers=MET_SEARCH_WORKERS) as executor:
+            for batch, excluded in executor.map(fetch_objects, batches):
+                works.extend(batch)
+                excluded_by_filters |= excluded
     end = offset + len(ids)
-    return SearchPage(works, end, bool(ids) and end < min(page["total"], 10000))
+    return SearchPage(works, end, bool(ids) and end < min(page["total"], 10000), excluded_by_filters)
 
 
 def cleveland_search(query, offset, filters, cancelled, fetch):

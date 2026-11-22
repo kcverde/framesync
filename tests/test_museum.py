@@ -1,17 +1,22 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import json
+import socket
 from pathlib import Path
 import tempfile
+import threading
+from urllib.parse import urlsplit
 import unittest
 from unittest.mock import patch
 
 from PIL import Image
 
-from framesync import museum
+from framesync import museum, museum_providers
 
 
 class MuseumTests(unittest.TestCase):
     def test_featured_collections_have_valid_offline_previews_and_fits(self):
-        from urllib.parse import unquote, urlsplit
+        from urllib.parse import unquote
 
         works = museum.featured_works()
         self.assertEqual({w["source"] for w in works[:3]}, set(museum.SOURCES))
@@ -31,13 +36,158 @@ class MuseumTests(unittest.TestCase):
     def test_search_skips_unavailable_images_and_advances_by_ids_examined(self):
         record = dict(objectID=7, isPublicDomain=True, primaryImage="original.jpg",
                       primaryImageSmall="preview.jpg", title="Garden", artistDisplayName="Artist", objectDate="1880")
-        responses = [{"total": 30, "objectIDs": [6, 7]}, {**record, "isPublicDomain": False}, record]
-        with patch.object(museum, "fetch_json", side_effect=responses) as fetch:
+        def respond(url):
+            if "/search?" in url:
+                return {"total": 30, "objectIDs": [6, 7]}
+            return record if url.endswith("/7") else {**record, "isPublicDomain": False}
+
+        with patch.object(museum, "fetch_json", side_effect=respond) as fetch:
             page = museum.search("garden & trees", 12, lambda: False)
         self.assertIn("q=garden+%26+trees", fetch.call_args_list[0].args[0])
         self.assertEqual([work["id"] for work in page.works], [7])
         self.assertEqual(page.next_offset, 14)
         self.assertTrue(page.more)
+
+    def test_met_search_reuses_connections_and_probes_four_images_concurrently(self):
+        jpeg = io.BytesIO()
+        Image.new("RGB", (50, 80), "blue").save(jpeg, "JPEG")
+        image = jpeg.getvalue()
+        ids = list(range(1, 13))
+        first_images = threading.Barrier(4, timeout=3)
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                path = urlsplit(self.path).path
+                requests.append((path, self.client_address))
+                if path.endswith("/search"):
+                    body = json.dumps({"total": 24, "objectIDs": ids}).encode()
+                elif "/image/" in path:
+                    if int(path.rsplit("/", 1)[-1]) in (1, 4, 7, 10):
+                        first_images.wait()
+                    body = image
+                else:
+                    object_id = int(path.rsplit("/", 1)[-1])
+                    body = json.dumps(dict(objectID=object_id, isPublicDomain=True,
+                                           primaryImage=f"https://example.org/image/{object_id}")).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        import urllib3
+
+        with tempfile.TemporaryDirectory() as directory, ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            original = urllib3.PoolManager.request
+
+            def loopback(pool, method, url, **kwargs):
+                parsed = urlsplit(url)
+                return original(pool, method, f"http://127.0.0.1:{server.server_port}{parsed.path}?{parsed.query}", **kwargs)
+
+            try:
+                from framesync.core import Store
+                library = museum.MuseumLibrary(Store(Path(directory)))
+                with patch.object(urllib3.PoolManager, "request", loopback), patch.object(museum_providers, "getproxies", return_value={}):
+                    page = museum.search("garden", 0, lambda: False, library=library)
+                    filtered = museum.search("garden", 0, lambda: False, library=library,
+                                             filters=museum.Filters(fits=True))
+            finally:
+                server.shutdown()
+                worker.join()
+        self.assertEqual([work["id"] for work in page.works], ids)
+        self.assertTrue(all((work["width"], work["height"]) == (50, 80) for work in page.works))
+        self.assertEqual(len({client for _, client in requests[:25]}), 5)
+        self.assertEqual(sum("/image/" in path for path, _ in requests), 12)
+        self.assertEqual(filtered.works, [])
+        self.assertTrue(filtered.excluded_by_filters)
+        self.assertTrue(filtered.more)
+        self.assertEqual(filtered.next_offset, 12)
+
+    def test_met_provider_filters_report_when_otherwise_usable_artwork_is_excluded(self):
+        def fetch(url):
+            if "/search?" in url:
+                return {"total": 2, "objectIDs": [1]}
+            return dict(objectID=1, isPublicDomain=True, primaryImage="https://example.org/image",
+                        artistDisplayName="Other", department="Other")
+
+        for filters in (museum.Filters(artist="Selected"), museum.Filters(department="Selected")):
+            with self.subTest(filters=filters), patch.object(museum, "fetch_json", side_effect=fetch):
+                page = museum.search("garden", 0, lambda: False, filters=filters)
+                self.assertEqual(page.works, [])
+                self.assertTrue(page.more)
+                self.assertTrue(page.excluded_by_filters)
+
+    def test_cancel_interrupts_a_pooled_proxy_connect_wait(self):
+        with socket.socket() as listener:
+            listener.settimeout(2)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            proxy = f"http://127.0.0.1:{listener.getsockname()[1]}"
+            task = museum.MuseumTask(lambda cancelled: museum.search("garden", 0, cancelled))
+            with patch.object(museum_providers, "getproxies", return_value={"https": proxy}), \
+                    patch.object(museum_providers, "proxy_bypass", return_value=False):
+                task.start()
+                try:
+                    client, _ = listener.accept()
+                    with client:
+                        client.settimeout(2)
+                        request = b""
+                        while b"\r\n\r\n" not in request:
+                            part = client.recv(4096)
+                            self.assertTrue(part)
+                            request += part
+                        self.assertTrue(request.startswith(b"CONNECT collectionapi.metmuseum.org:443"))
+                        task.requestInterruption()
+                        self.assertTrue(task.wait(1000))
+                        self.assertIn("cancelled", task.error)
+                        self.assertEqual(client.recv(4096), b"")
+                finally:
+                    task.requestInterruption()
+                    task.wait()
+
+    def test_pooled_header_wait_obeys_total_deadline(self):
+        import urllib3
+
+        with socket.socket() as listener:
+            listener.settimeout(2)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            endpoint = f"http://127.0.0.1:{listener.getsockname()[1]}/"
+            original = urllib3.PoolManager.request
+
+            def loopback(pool, method, url, **kwargs):
+                return original(pool, method, endpoint, **kwargs)
+
+            task = museum.MuseumTask(lambda cancelled: museum.search("garden", 0, cancelled))
+            with patch.object(urllib3.PoolManager, "request", loopback), \
+                    patch.object(museum_providers, "getproxies", return_value={}), \
+                    patch.object(museum_providers, "JSON_DEADLINE_SECONDS", 0.3):
+                task.start()
+                try:
+                    client, _ = listener.accept()
+                    with client:
+                        client.settimeout(2)
+                        self.assertIn(b"GET ", client.recv(4096))
+                        client.sendall(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+                        for _ in range(40):
+                            try:
+                                client.sendall(b"a")
+                            except OSError:
+                                break
+                            if task.wait(20):
+                                break
+                        self.assertTrue(task.wait(100))
+                        self.assertIn("Timed out", task.error)
+                finally:
+                    task.requestInterruption()
+                    task.wait()
 
     def test_import_reuses_identical_file_and_preserves_name_collision(self):
         jpeg = io.BytesIO()
@@ -259,10 +409,7 @@ class MuseumTests(unittest.TestCase):
                 preview.directory.cleanup()
 
     def test_socket_backed_fetch_json_enforces_total_deadline_and_shutdown_abort(self):
-        import socket
-        import threading
         import time
-        from framesync import museum_providers
 
         class SocketResponse:
             def __init__(self, sock):
@@ -295,30 +442,48 @@ class MuseumTests(unittest.TestCase):
         finally:
             server.close()
 
-        # Cancellation must also wake a thread blocked on a real socket read immediately.
-        client2, server2 = socket.socketpair()
-        entered = threading.Event()
-        errors = []
-        try:
-            client2.settimeout(5.0)
-            server2.sendall(b'{"partial": ')
+        # The same cancellation must reach responses owned by Met executor workers.
+        for met_search in (False, True):
+            with self.subTest(met_search=met_search):
+                client, server = socket.socketpair()
+                entered = threading.Event()
+                errors = []
 
-            def reader(cancelled):
-                entered.set()
+                class BlockingResponse(SocketResponse):
+                    def read(self, size=-1):
+                        entered.set()
+                        return super().read(size)
+
+                def read(cancelled):
+                    try:
+                        if met_search:
+                            museum.search("garden", 0, cancelled)
+                        else:
+                            museum_providers.fetch_json("https://example.org/blocked.json")
+                    except Exception as exc:
+                        errors.append(exc)
+
                 try:
-                    museum_providers.fetch_json("https://example.org/blocked.json")
-                except Exception as exc:
-                    errors.append(exc)
+                    client.settimeout(5.0)
+                    server.sendall(b'{"partial": ')
+                    response = BlockingResponse(client)
 
-            with patch.object(museum_providers, "urlopen", return_value=SocketResponse(client2)):
-                task = museum.MuseumTask(reader)
-                task.start()
-                self.assertTrue(entered.wait(2))
-                time.sleep(0.05)
-                started = time.monotonic()
-                task.requestInterruption()
-                self.assertTrue(task.wait(1000))
-                self.assertLess(time.monotonic() - started, 0.5)
-                self.assertTrue(any(isinstance(e, InterruptedError) for e in errors))
-        finally:
-            server2.close()
+                    def open_response(request, timeout, *, deadline):
+                        if "/search?" in request.full_url:
+                            return io.BytesIO(b'{"objectIDs":[7],"total":1}')
+                        return response
+
+                    with patch.object(museum_providers, "urlopen", side_effect=open_response):
+                        task = museum.MuseumTask(read)
+                        task.start()
+                        try:
+                            self.assertTrue(entered.wait(2))
+                            task.requestInterruption()
+                            self.assertTrue(task.wait(1000))
+                            self.assertIsInstance(errors[0], InterruptedError)
+                        finally:
+                            task.requestInterruption()
+                            task.wait()
+                finally:
+                    client.close()
+                    server.close()

@@ -127,6 +127,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyside6-essentials" },
     { name = "samsungtvws" },
+    { name = "urllib3" },
 ]
 
 [package.dev-dependencies]
@@ -139,6 +140,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12,<13" },
     { name = "pyside6-essentials", specifier = ">=6.10,<7" },
     { name = "samsungtvws", specifier = "==3.0.7" },
+    { name = "urllib3", specifier = ">=2.3,<3" },
 ]
 
 [package.metadata.requires-dev]

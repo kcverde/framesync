@@ -14,6 +14,7 @@ from urllib.error import URLError
 
 from PIL import Image, ImageFile, ImageOps
 from PySide6.QtCore import QThread
+from urllib3.exceptions import HTTPError as PooledHTTPError
 
 from .museum_providers import (
     Filters, MAX_IMPORT_BYTES, SOURCES, SearchPage, abort_thread_requests, chicago_search,
@@ -39,7 +40,7 @@ def image_size(url, cancelled):
     # Stop reading as soon as they are available, including on servers without Range support.
     parser = ImageFile.Parser()
     deadline = monotonic() + 12.0
-    with urlopen(museum_request(url), timeout=8) as source, tracked_response(source, deadline=deadline) as expired:
+    with urlopen(museum_request(url), timeout=8, deadline=deadline) as source, tracked_response(source, deadline=deadline) as expired:
         try:
             for _ in range(64):
                 if cancelled():
@@ -120,7 +121,7 @@ class MuseumLibrary:
             size = image_size(url, cancelled)
         except InterruptedError:
             raise
-        except (OSError, ValueError, URLError, Image.DecompressionBombError):
+        except (OSError, ValueError, URLError, PooledHTTPError, Image.DecompressionBombError):
             return 0, 0
         if all(size):
             with self.store.connect() as db:
@@ -129,15 +130,19 @@ class MuseumLibrary:
 
 
 def search(query, offset, cancelled, *, filters=Filters(), library=None):
-    providers = {"met": met_search, "cleveland": cleveland_search, "chicago": chicago_search}
-    page = providers[filters.source](query, offset, filters, cancelled, fetch_json)
+    if filters.source == "met":
+        page = met_search(query, offset, filters, cancelled, fetch_json,
+                          dimensions=library.dimensions if library else None)
+    else:
+        providers = {"cleveland": cleveland_search, "chicago": chicago_search}
+        page = providers[filters.source](query, offset, filters, cancelled, fetch_json)
     curated = {w["key"]: w for w in featured_works("chicago")} if filters.source == "chicago" else {}
     matches = []
     for work in page.works:
         if cancelled():
             raise InterruptedError("Museum search cancelled.")
         work = curated.get(work["key"], work)
-        if library and work["source"] != "chicago" and not (work["width"] and work["height"]):
+        if library and work["source"] == "cleveland" and not (work["width"] and work["height"]):
             work["width"], work["height"] = library.dimensions(work["original"], cancelled)
         width, height = work["width"], work["height"]
         if filters.fits and (width < 3840 or height < 2160):
@@ -151,7 +156,8 @@ def search(query, offset, cancelled, *, filters=Filters(), library=None):
             if orientation != filters.orientation:
                 continue
         matches.append(work)
-    return SearchPage(matches, page.next_offset, page.more)
+    excluded = page.excluded_by_filters or len(matches) < len(page.works)
+    return SearchPage(matches, page.next_offset, page.more, excluded_by_filters=excluded)
 
 
 @dataclass
@@ -288,8 +294,7 @@ class MuseumTask(QThread):
     def requestInterruption(self):
         super().requestInterruption()
         with self._thread_lock:
-            thread_id = self._thread_id
-        abort_thread_requests(thread_id)
+            abort_thread_requests(self._thread_id)
 
     def run(self):
         ident = threading.get_ident()
@@ -302,6 +307,6 @@ class MuseumTask(QThread):
         except Exception as exc:
             self.error = str(exc) or type(exc).__name__
         finally:
-            clear_thread_cancellation(ident)
             with self._thread_lock:
+                clear_thread_cancellation(ident)
                 self._thread_id = None
