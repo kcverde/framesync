@@ -12,12 +12,15 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 
-from PIL import Image, ImageOps, __version__ as pillow_version, features
+from PIL import Image, ImageCms, ImageOps, __version__ as pillow_version, features
 
 EXTENSIONS = {".jpg", ".jpeg", ".png"}
 # Bump the recipe version whenever photo preparation changes its output.
-ENCODER_VERSION = json.dumps((1, pillow_version, features.version_codec("jpg"),
-                              features.version_feature("libjpeg_turbo")))
+JPEG_VERSION = (pillow_version, features.version_codec("jpg"),
+                features.version_feature("libjpeg_turbo"))
+LEGACY_ENCODER_VERSION = json.dumps((1, *JPEG_VERSION))
+ENCODER_VERSION = json.dumps((2, *JPEG_VERSION, features.version_module("littlecms2")))
+FRAME_SIZE = (3840, 2160)
 
 
 def validate_host(value: str) -> str:
@@ -54,18 +57,56 @@ def prepare_photo(path: Path, crop=None) -> bytes:
         return _prepare_photo(source, crop)
 
 
-def _prepare_photo(source, crop) -> bytes:
+def _to_srgb(image):
+    profile = image.info.get("icc_profile")
+    if not profile:
+        return image
+
+    # Transform color channels only. Keep the original per-pixel transparency.
+    alpha = None
+    color = image
+    if image.has_transparency_data:
+        alpha = image.convert("RGBA").getchannel("A")
+        color = image.convert("L" if image.mode in ("1", "L", "LA") else "RGB")
+    elif image.mode in ("1", "P"):
+        color = image.convert("L" if image.mode == "1" else "RGB")
+
+    try:
+        converted = ImageCms.profileToProfile(
+            color, io.BytesIO(profile), ImageCms.createProfile("sRGB"), outputMode="RGB"
+        )
+    except ImageCms.PyCMSError:
+        return image
+    if alpha is not None:
+        converted.putalpha(alpha)
+    return converted
+
+
+def _prepare_photo(source, crop, *, legacy=False) -> bytes:
     with Image.open(source) as original:
-        image = ImageOps.exif_transpose(original).convert("RGBA")
+        image = ImageOps.exif_transpose(original)
+        if legacy:
+            image = image.convert("RGBA")
+        else:
+            image = _to_srgb(image)
+            mode = "RGBA" if image.has_transparency_data else "RGB"
+            if image.mode != mode:
+                image = image.convert(mode)
         if crop and crop[0] == revision(os.fstat(source.fileno())):
             box = crop_box(image.size, *crop[1:])
-            image = image.resize((3840, 2160), Image.Resampling.LANCZOS, box=box)
+            image = image.resize(FRAME_SIZE, Image.Resampling.LANCZOS, box=box)
         else:
-            image.thumbnail((3840, 2160), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGB", (3840, 2160), "black")
-        canvas.paste(image, ((3840 - image.width) // 2, (2160 - image.height) // 2), image)
+            image.thumbnail(FRAME_SIZE, Image.Resampling.LANCZOS)
+
+        if image.mode == "RGBA" or image.size != FRAME_SIZE:
+            canvas = Image.new("RGB", FRAME_SIZE, "black")
+            offset = ((FRAME_SIZE[0] - image.width) // 2, (FRAME_SIZE[1] - image.height) // 2)
+            canvas.paste(image, offset, image if image.mode == "RGBA" else None)
+            image = canvas
+
         output = io.BytesIO()
-        canvas.save(output, "JPEG", quality=90)
+        # The pixels are sRGB. Keep the JPEG free of source metadata.
+        image.save(output, "JPEG", quality=90, icc_profile=None)
         return output.getvalue()
 
 
@@ -90,16 +131,25 @@ class Store:
             db.execute("CREATE TABLE IF NOT EXISTS crops (path TEXT PRIMARY KEY, revision TEXT, zoom REAL, x REAL, y REAL)")
             db.execute("""CREATE TABLE IF NOT EXISTS prepared_digests (
                 path TEXT PRIMARY KEY, revision TEXT, crop TEXT, encoder TEXT, digest TEXT)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS color_digests (
+                path TEXT PRIMARY KEY, revision TEXT, crop TEXT, encoder TEXT, digest TEXT, legacy_digest TEXT)""")
 
     def prepared_digest(self, key):
         with self.connect() as db:
-            row = db.execute("""SELECT digest FROM prepared_digests
-                                WHERE path=? AND revision=? AND crop=? AND encoder=?""", key).fetchone()
-            return row[0] if row else None
+            row = db.execute("""SELECT digest, legacy_digest FROM color_digests
+                                WHERE path=? AND revision=? AND crop=? AND encoder=?""",
+                             (*key, ENCODER_VERSION)).fetchone()
+            if row:
+                return row
+            legacy = db.execute("""SELECT digest FROM prepared_digests
+                                   WHERE path=? AND revision=? AND crop=? AND encoder=?""",
+                                (*key, LEGACY_ENCODER_VERSION)).fetchone()
+            return None, legacy[0] if legacy else None
 
-    def cache_prepared_digest(self, key, digest):
+    def cache_prepared_digest(self, key, digest, legacy_digest):
         with self.connect() as db:
-            db.execute("INSERT OR REPLACE INTO prepared_digests VALUES (?, ?, ?, ?, ?)", (*key, digest))
+            db.execute("INSERT OR REPLACE INTO color_digests VALUES (?, ?, ?, ?, ?, ?)",
+                       (*key, ENCODER_VERSION, digest, legacy_digest))
 
     def crops(self):
         with self.connect() as db:
@@ -152,7 +202,7 @@ class Store:
                                  WHERE tv=? AND content_id IS NOT NULL""", (tv,)).fetchall()
 
     def record(self, tv: str, digest: str, name: str, content_id: str | None,
-               *, path: Path | None = None, resend: bool = False, work_key=None):
+               *, path: Path | None = None, resend: bool = False, work_key=None, legacy_digest=None):
         with self.connect() as db:
             if content_id is not None:
                 # The Frame may reuse a content ID after removing an older image.
@@ -164,7 +214,7 @@ class Store:
                 elif path is not None:
                     db.execute("INSERT OR IGNORE INTO upload_paths VALUES (?, ?, ?)", (tv, digest, str(path.absolute())))
                 if resend:
-                    db.execute("DELETE FROM removed WHERE tv=? AND digest=?", (tv, digest))
+                    db.execute("DELETE FROM removed WHERE tv=? AND digest IN (?, ?)", (tv, digest, legacy_digest))
 
     def clear_uncertain(self, tv: str):
         with self.connect() as db:
@@ -240,32 +290,55 @@ def sync_files(art, store: Store, tv: str, paths: list[Path], cancelled: threadi
             counts += f" · {excluded} previously removed"
         return f"{prefix} {counts}."
 
+    def lookup(digest, legacy_digest):
+        if not resend and (digest in removed or legacy_digest in removed):
+            return True, None
+        for candidate in (digest, legacy_digest):
+            previous = records.get(candidate)
+            if previous and previous[1] in existing:
+                return False, candidate
+        return False, None
+
     for index, path in enumerate(paths):
         if cancelled.is_set():
             return summary("Stopped.")
         progress(index, len(paths), f"Preparing {path.name}")
         crop = crops.get(str(path))
-        stamp = _source_revision(path.stat())
-        cache_path, cache_crop = str(path.absolute()), json.dumps(crop)
-        digest = store.prepared_digest((cache_path, stamp, cache_crop, ENCODER_VERSION))
-        previous = records.get(digest)
-        suppressed = digest in removed and not resend
-        already_synced = previous and previous[1] in existing
-        if not (suppressed or already_synced) or _source_revision(path.stat()) != stamp:
+        key = (str(path.absolute()), _source_revision(path.stat()), json.dumps(crop))
+        digest, legacy_digest = store.prepared_digest(key)
+        if _source_revision(path.stat()) != key[1]:
+            digest = legacy_digest = None
+
+        suppressed, matched = lookup(digest, legacy_digest)
+        # A current receipt alone cannot rule out a removal under the old recipe.
+        if not suppressed and (not matched or (removed and not resend and legacy_digest is None)):
             with path.open("rb") as source:
                 stamp = _source_revision(os.fstat(source.fileno()))
-                # Rehash any payload that could be sent, then look up its actual digest.
+                if stamp != key[1]:
+                    key = (key[0], stamp, key[2])
+                    legacy_digest = None
+                if legacy_digest is None and (records or removed):
+                    legacy_digest = hashlib.sha256(_prepare_photo(source, crop, legacy=True)).hexdigest()
+                    source.seek(0)
+                # Rehash the exact bytes that could be sent, even when the cache had a digest.
                 payload = _prepare_photo(source, crop)
                 digest = hashlib.sha256(payload).hexdigest()
-                if _source_revision(os.fstat(source.fileno())) == stamp:
-                    store.cache_prepared_digest((cache_path, stamp, cache_crop, ENCODER_VERSION), digest)
-        previous = records.get(digest)
-        if digest in removed and not resend:
+                if _source_revision(path.stat()) != stamp:
+                    raise RuntimeError(f"{path.name} changed during preparation. Sync again when the file is stable.")
+                store.cache_prepared_digest(key, digest, legacy_digest)
+            suppressed, matched = lookup(digest, legacy_digest)
+
+        if suppressed:
             excluded += 1
-        elif previous and previous[1] in existing:
-            store.record(tv, digest, previous[0], previous[1], path=path, resend=resend, work_key=work_key)
+        elif matched:
+            name, content_id = records[matched]
+            other_digest = legacy_digest if matched == digest else digest
+            store.record(tv, matched, name, content_id, path=path, resend=resend,
+                         work_key=work_key, legacy_digest=other_digest)
+            if resend:
+                removed.difference_update((digest, legacy_digest))
             if confirmed:
-                confirmed(digest, previous[1], True)
+                confirmed(matched, content_id, True)
             skipped += 1
         else:
             if cancelled.is_set():
@@ -280,7 +353,10 @@ def sync_files(art, store: Store, tv: str, paths: list[Path], cancelled: threadi
                 existing = content_ids(art)
                 if content_id not in existing:
                     raise RuntimeError("The new photo is not visible in the TV’s artwork list yet.")
-                store.record(tv, digest, path.name, content_id, path=path, resend=resend, work_key=work_key)
+                store.record(tv, digest, path.name, content_id, path=path, resend=resend,
+                             work_key=work_key, legacy_digest=legacy_digest)
+                if resend:
+                    removed.difference_update((digest, legacy_digest))
                 if snapshot is not None:
                     snapshot(existing.copy())
             except Exception as exc:
