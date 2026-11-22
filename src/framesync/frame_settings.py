@@ -114,6 +114,8 @@ class FrameSettings(QObject):
                    "mattes": read_mattes, "filters": read_filters}
         if section not in readers or self.backend.state["busy"]:
             return
+        if section in ("mattes", "filters") and section in self.values:
+            return
         self.values.pop(section, None)
         self.changed.emit()
         self.backend.run_tv_operation(readers[section], partial(self._store, section),

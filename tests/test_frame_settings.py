@@ -129,6 +129,23 @@ class FrameSettingsTests(unittest.TestCase):
         self.settings.setFilter("abc", "Pastel")
         self.assertEqual(self.art.set_photo_filter.call_count, 1)
 
+    def test_capabilities_are_cached_until_reset_even_when_empty(self):
+        self.art.get_matte_list = Mock(wraps=self.art.get_matte_list)
+        self.art.get_photo_filter_list = Mock(return_value=[])
+        self.art.get_artmode_settings = Mock(wraps=self.art.get_artmode_settings)
+        for _ in range(2):
+            for section in ("mattes", "filters", "display"):
+                self.settings.load(section)
+        self.art.get_matte_list.assert_called_once()
+        self.art.get_photo_filter_list.assert_called_once()
+        self.assertEqual(self.art.get_artmode_settings.call_count, 2)
+
+        self.settings.reset()
+        self.settings.load("mattes")
+        self.settings.load("filters")
+        self.assertEqual(self.art.get_matte_list.call_count, 2)
+        self.assertEqual(self.art.get_photo_filter_list.call_count, 2)
+
     def test_rejected_changes_do_not_emit_success(self):
         self.art.set_favourite = Mock(side_effect=ResponseError("unsupported"))
         events = []

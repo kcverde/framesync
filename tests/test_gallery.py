@@ -94,34 +94,39 @@ class GalleryTests(unittest.TestCase):
 
         with patch.object(controller, "start_task", side_effect=run) as tv, \
                 patch("framesync.gallery.monotonic", return_value=0) as clock, \
-                patch.object(self.art, "available", wraps=self.art.available) as listing:
+                patch.object(self.art, "available", wraps=self.art.available) as listing, \
+                patch.object(self.art, "get_thumbnail_list", wraps=self.art.get_thumbnail_list) as thumbs:
             gallery.openPage()
             listing.assert_called_once()
-            self.assertEqual([c.args[:2] for c in task.progress.emit.call_args_list],
-                             [(0, 2), (1, 2), (2, 2)])
+            thumbs.assert_called_once_with(self.art.ids[:12])
+            self.assertEqual(gallery.rows[0]["cid"], "builtin")
+            self.assertEqual(gallery.state["pages"], 2)
+
             clock.return_value = 119
             gallery.goToPage(1)
+            listing.assert_called_once()
+            thumbs.assert_called_with(self.art.ids[12:])
             self.assertEqual(gallery.rows[0]["cid"], "photo-11")
             gallery.goToPage(0)
-            self.assertEqual(tv.call_count, 1)
-            self.assertEqual(gallery.rows[0]["cid"], "builtin")
-            self.assertEqual(PAGE_CACHE_SECONDS, 120)
+            self.assertEqual(tv.call_count, 2)
+            self.assertEqual(thumbs.call_count, 2)
+
             clock.return_value = PAGE_CACHE_SECONDS
             gallery.goToPage(1)
-            self.assertEqual(tv.call_count, 2)
-            gallery.goToPage(0)
-            gallery.show("photo-0")
-            gallery.goToPage(1)
-            self.assertEqual(tv.call_count, 4)
+            self.assertEqual(listing.call_count, 2)
+            self.assertEqual(thumbs.call_count, 3)
+            thumbs.assert_called_with(self.art.ids[12:])
+
             gallery.refresh()
-            gallery.goToPage(0)
-            self.assertEqual(tv.call_count, 5)
+            self.assertEqual(listing.call_count, 3)
+            self.assertEqual(thumbs.call_count, 4)
             controller.frameSettings.artworkChanged.emit("photo-0")
             gallery.openPage()
-            self.assertEqual(tv.call_count, 6)
+            self.assertEqual(listing.call_count, 4)
             gallery.reset()
             gallery.openPage()
-            self.assertEqual(tv.call_count, 7)
+            self.assertEqual(listing.call_count, 5)
+            thumbs.assert_called_with(self.art.ids[:12])
 
     def test_current_thumbnail_and_show(self):
         self.sync()

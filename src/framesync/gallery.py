@@ -86,6 +86,8 @@ def _catalog(art, store, host, items=None):
     message = ""
     try:
         current = str((call_tv(art, art.get_current) or {}).get("content_id") or "")
+    except InterruptedError:
+        raise
     except Exception:
         current = ""
     # Some Frames include untitled server references alongside the photo library.
@@ -125,17 +127,12 @@ def frame_page(art, store, host, page=0, *, items=None, ignore_thumbnail_errors=
     return _read_page(art, page, *_catalog(art, store, host, items), ignore_thumbnail_errors=ignore_thumbnail_errors)
 
 
-def load_gallery(art, task):
-    catalog = _catalog(art, task.store, task.host)
-    total = max(1, (len(catalog[0]) + PAGE_SIZE - 1) // PAGE_SIZE)
-    pages = []
-    for index in range(total):
-        if task.cancelled.is_set():
-            raise InterruptedError("Gallery loading cancelled.")
-        task.progress.emit(index, total, f"Loading gallery page {index + 1} of {total}…")
-        pages.append(_read_page(art, index, *catalog))
-    task.progress.emit(total, total, "Gallery loaded.")
-    return pages
+def load_gallery(art, task, *, page=0, catalog=None):
+    if catalog is None:
+        catalog = _catalog(art, task.store, task.host)
+    if task.cancelled.is_set():
+        raise InterruptedError("Gallery loading cancelled.")
+    return _read_page(art, page, *catalog), catalog
 
 
 def show_artwork(art, store, host, page, cid):
@@ -186,7 +183,8 @@ class Gallery(QObject):
         super().__init__(backend)
         self.backend = backend
         self.snapshot = None
-        self._pages = []
+        self._pages = {}
+        self._catalog = None
         self._expires = 0
 
     @Property("QVariantList", notify=changed)
@@ -212,7 +210,9 @@ class Gallery(QObject):
 
     @Slot()
     def invalidatePages(self):
+        self.backend.cancel_gallery()
         self._pages.clear()
+        self._catalog = None
 
     def _apply(self, snapshot):
         self.snapshot = snapshot
@@ -229,21 +229,10 @@ class Gallery(QObject):
         work = partial(operation, store=backend.store, host=backend.host.strip(), page=page, **kwargs)
         backend.run_tv_operation(work, self._apply, message)
 
-    def _preload(self, index):
-        if not self.backend.paired:
-            return
-
-        def loaded(pages):
-            self._pages = pages
-            self._expires = monotonic() + PAGE_CACHE_SECONDS
-            self._apply(pages[min(index, len(pages) - 1)])
-
-        self.backend.start_task(load_gallery, loaded, "Loading gallery…", gallery_loading=True)
-
     @Slot()
     def refresh(self):
-        self._pages.clear()
-        self._preload(self.state["page"])
+        self.invalidatePages()
+        self._visit(self.state["page"])
 
     @Slot()
     def openPage(self):
@@ -255,23 +244,37 @@ class Gallery(QObject):
             self._visit(index)
 
     def _visit(self, index):
-        if index < len(self._pages) and monotonic() < self._expires:
-            if self.snapshot is not self._pages[index]:
-                self.snapshot = self._pages[index]
-                self.backend.set_message("")
-                self.changed.emit()
+        if not self.backend.paired or self.backend.gallery_task:
             return
-        self._preload(index)
+        if self._catalog is not None and monotonic() >= self._expires:
+            self.invalidatePages()
+        if index in self._pages:
+            if self.snapshot is not self._pages[index]:
+                self._apply(self._pages[index])
+                self.backend.set_message("")
+            return
+
+        catalog = self._catalog
+
+        def loaded(result):
+            snapshot, self._catalog = result
+            if catalog is None:
+                self._expires = monotonic() + PAGE_CACHE_SECONDS
+            self._pages[snapshot.page] = snapshot
+            self._apply(snapshot)
+
+        work = partial(load_gallery, page=index, catalog=catalog)
+        self.backend.start_task(work, loaded, "Loading gallery page…", gallery_loading=True)
 
     @Slot(str)
     def show(self, cid):
         if any(row["cid"] == cid for row in self.rows):
-            self._pages.clear()
+            self.invalidatePages()
             self._start(show_artwork, self.state["page"], "Displaying artwork…", cid=cid)
 
     @Slot(str, str)
     def remove(self, cid, identity):
         if identity and any(row["cid"] == cid and row["identity"] == identity for row in self.rows):
-            self._pages.clear()
+            self.invalidatePages()
             self._start(remove_artwork, self.state["page"], "Removing artwork from the Frame…",
                         cid=cid, identity=identity)

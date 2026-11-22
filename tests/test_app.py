@@ -25,7 +25,10 @@ class FakeTV:
         self.closed = False
         self.instances.append(self)
 
-    def open(self):
+    def open(self, resources=None):
+        pass
+
+    def _abort_d2d_sockets(self):
         pass
 
     def available(self):
@@ -48,6 +51,10 @@ class AppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.enterContext(patch("framesync.tv._open_read_channel",
+                                side_effect=lambda channel, *_: channel.open()))
 
     def window(self, store):
         controller = Controller(store)
@@ -92,10 +99,10 @@ class AppTests(unittest.TestCase):
 
         started, release = Event(), Event()
 
-        def delayed_load(art, task):
+        def delayed_load(art, task, **kwargs):
             started.set()
             release.wait(3)
-            return load_gallery(art, task)
+            return load_gallery(art, task, **kwargs)
 
         with tempfile.TemporaryDirectory() as directory, patch("framesync.tv.FrameArt", FakeTV), \
                 patch("framesync.tv.SamsungTVWS", FakeRemote), \

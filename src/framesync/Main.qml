@@ -171,6 +171,11 @@ ApplicationWindow {
                                 portCombo.currentIndex = portIndex
                         }
                     }
+                    FrameButton {
+                        visible: !!win.session.connecting || !!win.session.reconnecting
+                        text: "Cancel"
+                        onClicked: backend.cancelConnection()
+                    }
                     FrameButton { objectName: "connect"; text: win.session.reconnecting ? "Reconnecting…" : "Connect"; enabled: !win.session.busy && !win.session.reconnecting; onClicked: backend.launch(false) }
                 }
                 FrameButton {
@@ -230,10 +235,11 @@ ApplicationWindow {
                         font.pixelSize: 13
                         quiet: true
                         horizontalPadding: 3
-                        text: "Retry"
-                        visible: !setup.visible && !win.paired && !win.session.reconnecting
-                        enabled: !win.session.busy
-                        onClicked: backend.launch(false)
+                        readonly property bool canCancel: !!win.session.connecting || !!win.session.reconnecting
+                        text: canCancel ? "Cancel" : "Retry"
+                        visible: !setup.visible && !win.paired
+                        enabled: canCancel || !win.session.busy
+                        onClicked: canCancel ? backend.cancelConnection() : backend.launch(false)
                     }
                     FrameButton {
                         id: appearanceButton

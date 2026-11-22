@@ -35,7 +35,7 @@ class SelectedPhotoTests(unittest.TestCase):
                 return str(len(sent) - 1)
 
         @contextmanager
-        def connection(*args):
+        def connection(*args, **kwargs):
             yield TV()
 
         with TemporaryDirectory() as directory, patch("framesync.app.artwork_connection", connection):

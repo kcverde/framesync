@@ -14,7 +14,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from .core import EXTENSIONS, Store, content_ids, photos_in, revision, sync_files, sync_folder, validate_host
 from .gallery import Gallery, show_artwork
 from .frame_settings import FrameSettings
-from .tv import artwork_connection
+from .tv import ReadCancellation, artwork_connection
 from . import museum
 
 
@@ -22,7 +22,7 @@ class Task(QThread):
     progress = Signal(int, int, str)
     status = Signal(str)
 
-    def __init__(self, store, host, port, operation, completed, syncing, tv_lock, *, reconnect=False):
+    def __init__(self, store, host, port, operation, completed, syncing, tv_lock, *, reconnect=False, read_only=False):
         super().__init__()
         self.store, self.host, self.port = store, host, port
         self.operation = operation
@@ -31,6 +31,7 @@ class Task(QThread):
         self.tv_lock = tv_lock
         self.reconnect = reconnect
         self.cancelled = threading.Event()
+        self.read_cancellation = ReadCancellation(self.cancelled) if read_only or reconnect else None
         self.output = None
         self.error = ""
         self.content_snapshot = None
@@ -40,16 +41,30 @@ class Task(QThread):
     def snapshot(self, ids):
         self.content_snapshot = set(ids)
 
+    def cancel(self):
+        if self.read_cancellation is not None:
+            self.read_cancellation.cancel()
+        else:
+            self.cancelled.set()
+
     def run(self):
         try:
             with self.tv_lock:
                 if self.cancelled.is_set():
                     raise InterruptedError("TV operation cancelled.")
                 options = {"reconnect": True} if self.reconnect else {}
+                if self.read_cancellation is not None:
+                    options["cancellation"] = self.read_cancellation
                 with artwork_connection(self.store, self.host, self.port, self.status.emit, **options) as art:
                     self.output = self.operation(art, self)
+            if self.read_cancellation is not None:
+                self.read_cancellation.check()
         except Exception as exc:
-            self.error = str(exc) or type(exc).__name__
+            if self.read_cancellation is not None and self.cancelled.is_set():
+                self.error = "TV operation cancelled."
+                self.content_snapshot = None
+            else:
+                self.error = str(exc) or type(exc).__name__
 
 
 def read_library(art, task):
@@ -104,7 +119,6 @@ class Controller(QObject):
         self.task = None
         self.tv_lock = threading.Lock()
         self.gallery_task = None
-        self.gallery_done = self.gallery_total = 0
         self.gallery_message = ""
         self.museum_task = None
         self.museum_preview = None
@@ -166,8 +180,8 @@ class Controller(QObject):
     def state(self):
         return dict(host=self.host, port=self.port, paired=self.paired, knownTarget=self.known_target, reconnecting=self.reconnect_task is not None, busy=bool(self.task or self.museum_task),
                     museumSending=bool(self.task and self.task.museum_preview),
-                    galleryLoading=self.gallery_task is not None, galleryDone=self.gallery_done,
-                    galleryTotal=self.gallery_total, galleryMessage=self.gallery_message,
+                    connecting=bool(self.task and self.task.read_cancellation is not None),
+                    galleryLoading=self.gallery_task is not None, galleryMessage=self.gallery_message,
                     syncing=bool(self.task and self.task.syncing), folder=str(self.folder or ""),
                     selectedCount=len(self.selected), folderCount=len(self.folder_paths),
                     ready=self.paired and bool(self.folder_paths) and not (self.task or self.museum_task) and not self.uncertain,
@@ -438,7 +452,6 @@ class Controller(QObject):
         self.host, self.port = host, port
         self.known_target = self.last_connection == {"host": host.strip(), "port": port}
         self.paired = False
-        self.cancel_gallery()
         self.gallery.reset()
         self._frame_settings.reset()
         self.updateMuseumOnFrame(set())
@@ -577,7 +590,7 @@ class Controller(QObject):
 
     def cancel_reconnect(self):
         if self.reconnect_task:
-            self.reconnect_task.cancelled.set()
+            self.reconnect_task.cancel()
             self.reconnect_task = None
 
     @Slot()
@@ -603,7 +616,7 @@ class Controller(QObject):
             self.gallery.reset()
             self._frame_settings.reset()
             self.updateMuseumOnFrame(set())
-            self.start_task(read_library, self.connected, "Connecting to your TV…")
+            self.start_task(read_library, self.connected, "Connecting to your TV…", read_only=True)
 
     def connected(self, count):
         self.paired = True
@@ -642,7 +655,7 @@ class Controller(QObject):
             return False
         return self.start_task(lambda art, _: operation(art), finished, message)
 
-    def start_task(self, operation, completed, message, syncing=False, gallery_loading=False):
+    def start_task(self, operation, completed, message, syncing=False, gallery_loading=False, *, read_only=False):
         if self.task or (self.museum_task and not gallery_loading) or (gallery_loading and self.gallery_task):
             return False
         try:
@@ -653,19 +666,17 @@ class Controller(QObject):
             self.set_message(str(exc))
             return False
         if gallery_loading:
-            task = Task(self.store, host, self.port, operation, completed, False, self.tv_lock)
+            task = Task(self.store, host, self.port, operation, completed, False, self.tv_lock, read_only=True)
             task.setParent(self)
             self.gallery_task = task
-            self.gallery_done = self.gallery_total = 0
             self.gallery_message = message
-            task.progress.connect(self.gallery_progress)
             task.finished.connect(self.gallery_finished)
             task.start()
             self.changed.emit()
             return True
         resume_gallery = self.gallery_task is not None
         self.cancel_gallery()
-        self.task = Task(self.store, host, self.port, operation, completed, syncing, self.tv_lock)
+        self.task = Task(self.store, host, self.port, operation, completed, syncing, self.tv_lock, read_only=read_only)
         self.task.setParent(self)
         self.task.resume_gallery = resume_gallery
         self.task.progress.connect(self.progress)
@@ -678,15 +689,9 @@ class Controller(QObject):
 
     def cancel_gallery(self):
         if self.gallery_task:
-            self.gallery_task.cancelled.set()
+            self.gallery_task.cancel()
             self.gallery_task = None
         self.gallery_message = ""
-
-    @Slot(int, int, str)
-    def gallery_progress(self, done, total, message):
-        if self.sender() is self.gallery_task:
-            self.gallery_done, self.gallery_total, self.gallery_message = done, total, message
-            self.changed.emit()
 
     @Slot()
     def gallery_finished(self):
@@ -705,7 +710,7 @@ class Controller(QObject):
         self.cancel_reconnect()
         self.cancel_gallery()
         if self.task:
-            self.task.cancelled.set()
+            self.task.cancel()
         if self.museum_task:
             self.museum_task.requestInterruption()
         for thread in self.findChildren(QThread):
@@ -742,9 +747,12 @@ class Controller(QObject):
         if task.syncing:
             self.gallery.reset()
         self.read_journal()
-        if task.content_snapshot is not None:
+        cancelled_read = task.read_cancellation is not None and task.cancelled.is_set()
+        if task.content_snapshot is not None and not cancelled_read:
             self.updateMuseumOnFrame(task.content_snapshot)
-        if task.error:
+        if cancelled_read:
+            self.set_message("TV operation cancelled.")
+        elif task.error:
             if task.museum_preview or task.showing_museum_upload:
                 self.museum_message = task.error
                 if task.museum_preview and self.uncertain:
@@ -759,14 +767,31 @@ class Controller(QObject):
         self.changed.emit()
 
     @Slot()
+    def cancelGallery(self):
+        self.cancel_gallery()
+        self.changed.emit()
+
+    @Slot()
+    def cancelConnection(self):
+        if self.reconnect_task:
+            self.cancel_reconnect()
+            self.set_message("Reconnect cancelled.")
+        elif self.task and self.task.read_cancellation is not None:
+            self.task.cancel()
+            self.set_message("Cancelling TV connection…")
+
+    @Slot()
     def stop(self):
         if self.museum_task:
             self.museum_task.requestInterruption()
             self.museum_message = "Cancelling museum request…"
             self.museumChanged.emit()
         if self.task:
-            self.task.cancelled.set()
-            self.set_message("Waiting for the current TV operation to finish…")
+            if self.task.read_cancellation is not None:
+                self.cancelConnection()
+            else:
+                self.task.cancel()
+                self.set_message("Waiting for the current TV operation to finish…")
 
     @Slot()
     def resolve(self):

@@ -72,6 +72,7 @@ ColumnLayout {
             color: FrameTheme.muted
             elide: Text.ElideRight
         }
+        FrameButton { text: "Cancel"; visible: !!page.session.galleryLoading; onClicked: page.backend.cancelGallery() }
         FrameButton { text: "Refresh"; enabled: page.active; onClicked: page.gallery.refresh() }
         FrameButton { text: "Frame settings…"; enabled: page.active; onClicked: frameOptions.showSettings() }
     }
@@ -79,11 +80,8 @@ ColumnLayout {
         objectName: "galleryLoadProgress"
         Layout.fillWidth: true
         visible: !!page.session.galleryLoading
-        indeterminate: !page.session.galleryTotal
-        from: 0
-        to: Math.max(1, page.session.galleryTotal || 0)
-        value: page.session.galleryDone || 0
-        Accessible.name: "Loading gallery pages"
+        indeterminate: true
+        Accessible.name: "Loading gallery page"
     }
     GridView {
         id: grid
